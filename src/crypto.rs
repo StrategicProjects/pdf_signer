@@ -13,11 +13,19 @@ use cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo, SignerIn
 use const_oid::db::rfc5911::{
     ID_AA_SIGNING_CERTIFICATE_V_2, ID_DATA, ID_MESSAGE_DIGEST, ID_SIGNING_TIME,
 };
-use const_oid::db::rfc5912::ID_SHA_256;
+use const_oid::db::rfc5912::{
+    ID_EC_PUBLIC_KEY, ID_SHA_256, ID_SHA_384, ID_SHA_512, RSA_ENCRYPTION, SECP_256_R_1,
+    SECP_384_R_1,
+};
 use const_oid::ObjectIdentifier;
 
 use der::asn1::{OctetString, SetOfVec, UtcTime};
 use der::{Any, DateTime, Decode, Encode, Sequence};
+
+use rsa::pkcs8::{DecodePrivateKey, PrivateKeyInfo};
+use sha2::{Sha384, Sha512};
+use signature::{Keypair, Signer};
+use spki::{DynSignatureAlgorithmIdentifier, SignatureBitStringEncoding};
 
 use std::time::SystemTime;
 use x509_cert::attr::Attribute;
@@ -44,7 +52,6 @@ struct SigningCertificateV2 {
 use p12_keystore::KeyStore;
 
 use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
-use rsa::pkcs8::DecodePrivateKey;
 use rsa::RsaPrivateKey;
 
 use sha2::{Digest, Sha256};
@@ -68,6 +75,13 @@ pub(crate) struct CmsVerification {
 fn sha256_alg() -> AlgorithmIdentifierOwned {
     AlgorithmIdentifierOwned {
         oid: ID_SHA_256,
+        parameters: None,
+    }
+}
+
+fn sha384_alg() -> AlgorithmIdentifierOwned {
+    AlgorithmIdentifierOwned {
+        oid: ID_SHA_384,
         parameters: None,
     }
 }
@@ -131,56 +145,115 @@ pub(crate) fn cms_sign(
         .ok_or_else(|| Error::Crypto("keystore has no certificate".into()))?;
     let cert_der = leaf.as_der().to_vec();
     let cert = Certificate::from_der(&cert_der).map_err(crypto)?;
-    let priv_key = RsaPrivateKey::from_pkcs8_der(chain.key()).map_err(crypto)?;
-    let signing_key = SigningKey::<Sha256>::new(priv_key);
-
-    // 2. Detached content: digest is supplied externally, eContent stays empty.
-    let digest = Sha256::digest(data);
-    let encap = EncapsulatedContentInfo {
-        econtent_type: ID_DATA,
-        econtent: None,
-    };
 
     let sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
         issuer: cert.tbs_certificate.issuer.clone(),
         serial_number: cert.tbs_certificate.serial_number.clone(),
     });
+    // Embed the whole chain (so intermediates are available for path building).
+    let cert_ders: Vec<Vec<u8>> = chain.chain().iter().map(|c| c.as_der().to_vec()).collect();
+    let key_der = chain.key();
 
-    let mut signer_info = SignerInfoBuilder::new(
-        &signing_key,
-        sid,
-        sha256_alg(),
-        &encap,
-        Some(digest.as_slice()),
-    )
-    .map_err(crypto)?;
-    signer_info
-        .add_signed_attribute(signing_time_attribute()?)
-        .map_err(crypto)?;
-    signer_info
-        .add_signed_attribute(signing_certificate_v2_attribute(&cert_der)?)
-        .map_err(crypto)?;
-
-    // 3. Assemble the SignedData, embedding the whole certificate chain (so
-    //    intermediates are available for path building and the DSS).
-    let mut builder = SignedDataBuilder::new(&encap);
-    builder.add_digest_algorithm(sha256_alg()).map_err(crypto)?;
-    for entry in chain.chain() {
-        let c = Certificate::from_der(entry.as_der()).map_err(crypto)?;
-        builder
-            .add_certificate(CertificateChoices::Certificate(c))
-            .map_err(crypto)?;
-    }
-    let content_info = builder
-        .add_signer_info::<SigningKey<Sha256>, Signature>(signer_info)
-        .map_err(crypto)?
-        .build()
-        .map_err(crypto)?;
+    // 2. Build the SignedData using the algorithm that matches the key type.
+    let content_info = match detect_key_kind(key_der)? {
+        KeyKind::Rsa => {
+            let sk = SigningKey::<Sha256>::new(RsaPrivateKey::from_pkcs8_der(key_der).map_err(crypto)?);
+            build_signed_data::<_, Signature>(
+                &sk, sha256_alg(), Sha256::digest(data).as_slice(), sid, &cert_der, &cert_ders,
+            )?
+        }
+        KeyKind::P256 => {
+            let sk = p256::ecdsa::SigningKey::from(
+                p256::SecretKey::from_pkcs8_der(key_der).map_err(crypto)?,
+            );
+            build_signed_data::<_, p256::ecdsa::DerSignature>(
+                &sk, sha256_alg(), Sha256::digest(data).as_slice(), sid, &cert_der, &cert_ders,
+            )?
+        }
+        KeyKind::P384 => {
+            let sk = p384::ecdsa::SigningKey::from(
+                p384::SecretKey::from_pkcs8_der(key_der).map_err(crypto)?,
+            );
+            build_signed_data::<_, p384::ecdsa::DerSignature>(
+                &sk, sha384_alg(), Sha384::digest(data).as_slice(), sid, &cert_der, &cert_ders,
+            )?
+        }
+    };
 
     match tsa_url {
         Some(url) => apply_timestamp(content_info, url),
         None => content_info.to_der().map_err(crypto),
     }
+}
+
+/// Supported signer key types.
+enum KeyKind {
+    Rsa,
+    P256,
+    P384,
+}
+
+/// Determine the signing key type from its PKCS#8 algorithm identifier.
+fn detect_key_kind(pkcs8_der: &[u8]) -> Result<KeyKind> {
+    let pki = PrivateKeyInfo::from_der(pkcs8_der).map_err(crypto)?;
+    let oid = pki.algorithm.oid;
+    if oid == RSA_ENCRYPTION {
+        Ok(KeyKind::Rsa)
+    } else if oid == ID_EC_PUBLIC_KEY {
+        let curve = pki.algorithm.parameters_oid().map_err(crypto)?;
+        if curve == SECP_256_R_1 {
+            Ok(KeyKind::P256)
+        } else if curve == SECP_384_R_1 {
+            Ok(KeyKind::P384)
+        } else {
+            Err(Error::Crypto(format!("unsupported EC curve: {curve}")))
+        }
+    } else {
+        Err(Error::Crypto(format!("unsupported signing key algorithm: {oid}")))
+    }
+}
+
+/// Assemble a detached `SignedData` (B-B: with `signing-certificate-v2`) over a
+/// pre-computed `data_digest`, generic over the signer and signature types.
+fn build_signed_data<S, Sig>(
+    signing_key: &S,
+    digest_alg: AlgorithmIdentifierOwned,
+    data_digest: &[u8],
+    sid: SignerIdentifier,
+    ess_cert_der: &[u8],
+    cert_ders: &[Vec<u8>],
+) -> Result<ContentInfo>
+where
+    S: Keypair + DynSignatureAlgorithmIdentifier + Signer<Sig>,
+    Sig: SignatureBitStringEncoding,
+{
+    let encap = EncapsulatedContentInfo {
+        econtent_type: ID_DATA,
+        econtent: None,
+    };
+    let mut signer_info =
+        SignerInfoBuilder::new(signing_key, sid, digest_alg.clone(), &encap, Some(data_digest))
+            .map_err(crypto)?;
+    signer_info
+        .add_signed_attribute(signing_time_attribute()?)
+        .map_err(crypto)?;
+    signer_info
+        .add_signed_attribute(signing_certificate_v2_attribute(ess_cert_der)?)
+        .map_err(crypto)?;
+
+    let mut builder = SignedDataBuilder::new(&encap);
+    builder.add_digest_algorithm(digest_alg).map_err(crypto)?;
+    for der in cert_ders {
+        let c = Certificate::from_der(der).map_err(crypto)?;
+        builder
+            .add_certificate(CertificateChoices::Certificate(c))
+            .map_err(crypto)?;
+    }
+    builder
+        .add_signer_info::<S, Sig>(signer_info)
+        .map_err(crypto)?
+        .build()
+        .map_err(crypto)
 }
 
 /// Fetch an RFC 3161 timestamp over the signature and embed it as the
@@ -280,8 +353,8 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
         .as_ref()
         .ok_or_else(|| Error::Verification("signer has no signed attributes".into()))?;
 
-    // 1. messageDigest attribute must equal SHA-256(data).
-    let want = Sha256::digest(data);
+    // 1. messageDigest attribute must equal H(data) for the SignerInfo's digest.
+    let want = digest_data(si.digest_alg.oid, data)?;
     let mut found_digest = None;
     for attr in signed_attrs.iter() {
         if attr.oid == ID_MESSAGE_DIGEST {
@@ -295,7 +368,7 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
         }
     }
     match found_digest {
-        Some(d) if d == want.as_slice() => {}
+        Some(d) if d == want => {}
         Some(_) => return Err(Error::Verification("messageDigest mismatch".into())),
         None => return Err(Error::Verification("no messageDigest attribute".into())),
     }
@@ -303,25 +376,64 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
     // 2. Locate the signer certificate by issuer + serial.
     let cert = find_signer_cert(&sd, si)?;
 
-    // 3. Verify the RSA signature over the DER of the signed attributes.
-    let spki_der = cert
-        .tbs_certificate
-        .subject_public_key_info
-        .to_der()
-        .map_err(crypto)?;
-    let pub_key = rsa::RsaPublicKey::from_public_key_der(&spki_der).map_err(crypto)?;
-    let verifying_key = VerifyingKey::<Sha256>::new(pub_key);
-
+    // 3. Verify the signer's signature over the DER of the signed attributes,
+    //    using RSA or ECDSA according to the certificate's public key.
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki_der = spki.to_der().map_err(crypto)?;
     let signed_attrs_der = signed_attrs.to_der().map_err(crypto)?;
-    let signature = Signature::try_from(si.signature.as_bytes()).map_err(crypto)?;
+    let sig_bytes = si.signature.as_bytes();
 
-    verifying_key
-        .verify(&signed_attrs_der, &signature)
-        .map_err(|e| Error::Verification(format!("signature invalid: {e}")))?;
+    let ok = if spki.algorithm.oid == RSA_ENCRYPTION {
+        let pub_key = rsa::RsaPublicKey::from_public_key_der(&spki_der).map_err(crypto)?;
+        let vk = VerifyingKey::<Sha256>::new(pub_key);
+        match Signature::try_from(sig_bytes) {
+            Ok(s) => vk.verify(&signed_attrs_der, &s).is_ok(),
+            Err(_) => false,
+        }
+    } else if spki.algorithm.oid == ID_EC_PUBLIC_KEY {
+        verify_ecdsa_sig(&spki_der, &signed_attrs_der, sig_bytes)
+    } else {
+        return Err(Error::Verification("unsupported signer key algorithm".into()));
+    };
+    if !ok {
+        return Err(Error::Verification("signature invalid".into()));
+    }
 
     Ok(CmsVerification {
         signer_subject: cert.tbs_certificate.subject.to_string(),
     })
+}
+
+/// Hash `data` with the digest named by `oid` (SHA-256/384/512).
+fn digest_data(oid: ObjectIdentifier, data: &[u8]) -> Result<Vec<u8>> {
+    if oid == ID_SHA_256 {
+        Ok(Sha256::digest(data).to_vec())
+    } else if oid == ID_SHA_384 {
+        Ok(Sha384::digest(data).to_vec())
+    } else if oid == ID_SHA_512 {
+        Ok(Sha512::digest(data).to_vec())
+    } else {
+        Err(Error::Verification("unsupported digest algorithm".into()))
+    }
+}
+
+/// Verify an ECDSA signature (P-256 / P-384, DER `ECDSA-Sig-Value`) over `msg`.
+fn verify_ecdsa_sig(spki_der: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    use signature::Verifier as _;
+    use spki::DecodePublicKey as _;
+    if let (Ok(vk), Ok(s)) = (
+        p256::ecdsa::VerifyingKey::from_public_key_der(spki_der),
+        p256::ecdsa::DerSignature::try_from(sig),
+    ) {
+        return vk.verify(msg, &s).is_ok();
+    }
+    if let (Ok(vk), Ok(s)) = (
+        p384::ecdsa::VerifyingKey::from_public_key_der(spki_der),
+        p384::ecdsa::DerSignature::try_from(sig),
+    ) {
+        return vk.verify(msg, &s).is_ok();
+    }
+    false
 }
 
 fn find_signer_cert<'a>(

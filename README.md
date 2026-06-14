@@ -51,6 +51,8 @@ $ pdfsig signed.pdf
   roots): per-link signature (RSA **and** ECDSA P-256/P-384), validity,
   `basicConstraints` / `pathLenConstraint` / `keyCertSign`, and **CRL + OCSP**
   revocation.
+- **RSA and ECDSA** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA P-256/SHA-256
+  and P-384/SHA-384), detected automatically from the keystore.
 - **Pure Rust**, with an optional `https` feature (rustls) for TLS endpoints.
 
 ### PAdES levels
@@ -116,8 +118,8 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - **Path validation** covers the practical RFC 5280 subset (signatures,
   validity, basic constraints, path length, key usage, **CRL + OCSP**
   revocation) — **not** name constraints or certificate policies.
-- **Signing keys are RSA** (PKCS#1 v1.5 + SHA-256); ECDSA is supported on the
-  **verification** side (chain), not yet for the signer key.
+- **Signing keys**: RSA (PKCS#1 v1.5 + SHA-256) and ECDSA (P-256/SHA-256,
+  P-384/SHA-384). Ed25519 and other curves are not handled.
 - Incremental updates use a **traditional xref table** (chained via `/Prev`),
   accepted by PDF 1.5+ readers; no xref-*stream* output.
 - Visible appearances use **standard Helvetica** (WinAnsi); no embedded
@@ -131,8 +133,9 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] Certificate-chain validation (RSA + ECDSA, CRL + OCSP, RFC 5280 subset)
 - [x] Optional HTTPS (rustls) for TSA / CRL / OCSP
 - [x] [extendr](https://extendr.github.io/) bindings + vendoring for R / CRAN
-- [ ] ECDSA *signing* keys
+- [x] ECDSA signing keys (P-256 / P-384)
 - [ ] Full RFC 5280 path processing (name constraints, policies)
+- [ ] Ed25519 keys; xref-stream incremental updates
 - [ ] xref-stream incremental updates; richer appearances (fonts/images)
 
 ## License

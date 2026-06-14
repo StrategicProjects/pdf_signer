@@ -77,6 +77,59 @@ pub fn sample_pdf() -> Vec<u8> {
     buf
 }
 
+/// Build a self-signed **ECDSA P-256** certificate and wrap it in a PKCS#12.
+pub fn self_signed_p256_p12(password: &str) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let signing_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let subject = Name::from_str("CN=pdf_signer P-256,O=StrategicProjects,C=BR").unwrap();
+    let spki = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key()).unwrap();
+    let cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap(),
+        subject,
+        spki,
+        &signing_key,
+    )
+    .unwrap()
+    .build::<p256::ecdsa::DerSignature>()
+    .unwrap();
+    let key_der = signing_key.to_pkcs8_der().unwrap().as_bytes().to_vec();
+    ec_p12(password, &key_der, &cert.to_der().unwrap())
+}
+
+/// Build a self-signed **ECDSA P-384** certificate and wrap it in a PKCS#12.
+pub fn self_signed_p384_p12(password: &str) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let signing_key = p384::ecdsa::SigningKey::random(&mut rng);
+    let subject = Name::from_str("CN=pdf_signer P-384,O=StrategicProjects,C=BR").unwrap();
+    let spki = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key()).unwrap();
+    let cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap(),
+        subject,
+        spki,
+        &signing_key,
+    )
+    .unwrap()
+    .build::<p384::ecdsa::DerSignature>()
+    .unwrap();
+    let key_der = signing_key.to_pkcs8_der().unwrap().as_bytes().to_vec();
+    ec_p12(password, &key_der, &cert.to_der().unwrap())
+}
+
+fn ec_p12(password: &str, key_der: &[u8], cert_der: &[u8]) -> Vec<u8> {
+    let chain = PrivateKeyChain::new(
+        key_der,
+        b"poc",
+        vec![P12Certificate::from_der(cert_der).unwrap()],
+    );
+    let mut ks = KeyStore::new();
+    ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
+    ks.writer(password).write().unwrap()
+}
+
 /// Build a self-signed RSA-2048 certificate and wrap it in a PKCS#12 keystore.
 pub fn self_signed_p12(password: &str) -> Vec<u8> {
     let mut rng = rand::thread_rng();

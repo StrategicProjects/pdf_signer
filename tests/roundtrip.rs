@@ -1,4 +1,7 @@
-use pdf_signer::testkit::{ca_chain3_p12, ca_signed_p12, sample_pdf, self_signed_p12};
+use pdf_signer::testkit::{
+    ca_chain3_p12, ca_signed_p12, sample_pdf, self_signed_p12, self_signed_p256_p12,
+    self_signed_p384_p12,
+};
 use pdf_signer::{
     sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
     SignOptions, TrustStore,
@@ -241,6 +244,24 @@ fn chain_validates_through_intermediate_ca() {
         "{}",
         report.signatures[0].detail
     );
+}
+
+#[test]
+fn ecdsa_p256_sign_and_verify() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p256_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("P-256 sign");
+    let report = verify_pdf_bytes(&signed).expect("verify");
+    assert!(report.signatures[0].valid, "{}", report.signatures[0].detail);
+}
+
+#[test]
+fn ecdsa_p384_sign_and_verify() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p384_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("P-384 sign");
+    let report = verify_pdf_bytes(&signed).expect("verify");
+    assert!(report.signatures[0].valid, "{}", report.signatures[0].detail);
 }
 
 #[test]
