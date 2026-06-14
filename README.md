@@ -49,8 +49,9 @@ $ pdfsig signed.pdf
   timestamp.
 - **Certificate-chain validation** against a trust store (e.g. the **ICP-Brasil**
   roots): per-link signature (RSA **and** ECDSA P-256/P-384), validity,
-  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, and **CRL + OCSP**
-  revocation.
+  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, **CRL + OCSP**
+  revocation, **name constraints** (§4.2.1.10), and an optional **required
+  policy** OID.
 - **RSA and ECDSA** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA P-256/SHA-256
   and P-384/SHA-384), detected automatically from the keystore.
 - **Pure Rust**, with an optional `https` feature (rustls) for TLS endpoints.
@@ -115,9 +116,12 @@ pdf_signer = { version = "0.1", features = ["https"] }
 
 ## Scope & limitations
 
-- **Path validation** covers the practical RFC 5280 subset (signatures,
-  validity, basic constraints, path length, key usage, **CRL + OCSP**
-  revocation) — **not** name constraints or certificate policies.
+- **Path validation** covers the practical RFC 5280 subset: signatures,
+  validity, basic constraints, path length, key usage, CRL + OCSP revocation,
+  **name constraints**, and a **required-policy** OID check. The full policy
+  engine — `valid_policy_tree`, policy *mapping*,
+  `requireExplicitPolicy`/`inhibitPolicyMapping` — is **not** implemented
+  (doing it half-right is worse than not at all).
 - **Signing keys**: RSA (PKCS#1 v1.5 + SHA-256) and ECDSA (P-256/SHA-256,
   P-384/SHA-384). Ed25519 and other curves are not handled.
 - Incremental updates use a **traditional xref table** (chained via `/Prev`),
@@ -134,7 +138,8 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] Optional HTTPS (rustls) for TSA / CRL / OCSP
 - [x] [extendr](https://extendr.github.io/) bindings + vendoring for R / CRAN
 - [x] ECDSA signing keys (P-256 / P-384)
-- [ ] Full RFC 5280 path processing (name constraints, policies)
+- [x] RFC 5280 name constraints + required-policy check
+- [ ] Full policy processing (`valid_policy_tree`, policy mapping)
 - [ ] Ed25519 keys; xref-stream incremental updates
 - [ ] xref-stream incremental updates; richer appearances (fonts/images)
 

@@ -21,9 +21,15 @@ use rsa::RsaPublicKey;
 use sha2::{Sha256, Sha384, Sha512};
 use signature::Verifier;
 use spki::DecodePublicKey;
+use const_oid::db::rfc5280::ANY_POLICY;
+use const_oid::ObjectIdentifier;
 use sha1::Sha1;
 use x509_cert::crl::CertificateList;
-use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::{
+    BasicConstraints, CertificatePolicies, KeyUsage, NameConstraints, SubjectAltName,
+};
+use x509_cert::name::Name;
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, CertId, CertStatus};
 
@@ -32,10 +38,12 @@ use crate::Result;
 
 const MAX_DEPTH: usize = 10;
 
-/// A set of trusted root certificates (e.g. the ICP-Brasil AC Raiz set).
+/// A set of trusted root certificates (e.g. the ICP-Brasil AC Raiz set), plus
+/// optional validation parameters.
 #[derive(Clone, Default)]
 pub struct TrustStore {
     roots: Vec<Certificate>,
+    required_policy: Option<ObjectIdentifier>,
 }
 
 impl TrustStore {
@@ -47,18 +55,33 @@ impl TrustStore {
     /// Load trusted roots from one or more concatenated PEM certificates.
     pub fn from_pem(pem: &[u8]) -> Result<Self> {
         let roots = Certificate::load_pem_chain(pem).map_err(|e| Error::Crypto(e.to_string()))?;
-        Ok(Self { roots })
+        Ok(Self {
+            roots,
+            required_policy: None,
+        })
     }
 
     /// Load trusted roots from DER certificate blobs.
     pub fn from_ders<I: IntoIterator<Item = Vec<u8>>>(ders: I) -> Result<Self> {
         let mut roots = Vec::new();
         for der in ders {
-            roots.push(
-                Certificate::from_der(&der).map_err(|e| Error::Crypto(e.to_string()))?,
-            );
+            roots.push(Certificate::from_der(&der).map_err(|e| Error::Crypto(e.to_string()))?);
         }
-        Ok(Self { roots })
+        Ok(Self {
+            roots,
+            required_policy: None,
+        })
+    }
+
+    /// Require that the certificate path asserts a given policy OID (e.g. an
+    /// ICP-Brasil policy). Validation then fails unless the leaf — and every
+    /// intermediate that carries a policies extension — asserts it (or
+    /// `anyPolicy`). This is a practical subset of RFC 5280 §6.1 policy
+    /// processing (no policy mapping / `valid_policy_tree`).
+    pub fn require_policy(mut self, oid: &str) -> Result<Self> {
+        self.required_policy =
+            Some(ObjectIdentifier::new(oid).map_err(|e| Error::Crypto(e.to_string()))?);
+        Ok(self)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -83,8 +106,9 @@ pub(crate) struct ChainResult {
 ///
 /// Enforces, per RFC 5280 (practical subset): each link's signature, validity
 /// windows, issuer `basicConstraints` CA flag, `pathLenConstraint`,
-/// `keyCertSign` key usage, and CRL revocation. Not enforced: name constraints,
-/// certificate policies / policy mapping.
+/// `keyCertSign` key usage, CRL + OCSP revocation, **name constraints**, and an
+/// optional **required policy** OID. Not enforced: the full policy
+/// `valid_policy_tree` / policy mapping.
 pub(crate) fn verify_chain(
     leaf: &Certificate,
     pool: &[Certificate],
@@ -98,9 +122,12 @@ pub(crate) fn verify_chain(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let mut current = leaf.clone();
-    let mut intermediates = 0usize; // CAs traversed below `current`
-    for _ in 0..MAX_DEPTH {
+    // 1. Build the ordered path [leaf, intermediate..., root] with per-link
+    //    checks (signature, validity, revocation, CA constraints).
+    let mut path: Vec<Certificate> = vec![leaf.clone()];
+    let mut intermediates = 0usize;
+    loop {
+        let current = path.last().unwrap().clone();
         if !valid_at(&current, at) {
             return fail("a certificate in the path is expired or not yet valid");
         }
@@ -109,7 +136,7 @@ pub(crate) fn verify_chain(
         }
         // Signer certificate is itself a trusted root.
         if store.roots.iter().any(|r| same_cert(r, &current)) {
-            return ok("certificate is a trusted root");
+            return finalize(&path, store, at);
         }
         // Directly issued by a trusted root.
         if let Some(root) = store.roots.iter().find(|r| issued_by(&current, r)) {
@@ -119,10 +146,14 @@ pub(crate) fn verify_chain(
             if !valid_at(root, at) {
                 return fail("trusted root is expired");
             }
-            return ok(&format!("chains to trusted root ({})", dn(root)));
+            path.push(root.clone());
+            return finalize(&path, store, at);
         }
-        // Climb one intermediate from the pool. It must be a CA whose
-        // pathLenConstraint still permits the certificates below it.
+        if path.len() > MAX_DEPTH {
+            return fail("certificate path too long");
+        }
+        // Climb one intermediate; it must be a CA whose pathLenConstraint still
+        // permits the certificates below it, and assert keyCertSign.
         match pool
             .iter()
             .find(|c| !same_cert(c, &current) && issued_by(&current, c))
@@ -143,12 +174,197 @@ pub(crate) fn verify_chain(
                     return fail("a certificate in the path has been revoked (OCSP)");
                 }
                 intermediates += 1;
-                current = next.clone();
+                path.push(next.clone());
             }
             None => return fail("could not build a path to a trusted root"),
         }
     }
-    fail("certificate path too long")
+}
+
+/// Run the path-wide checks (name constraints, required policy) once a trusted
+/// root has been reached. `path` is `[leaf, intermediate..., root]`.
+fn finalize(path: &[Certificate], store: &TrustStore, _at: i64) -> ChainResult {
+    if let Err(detail) = check_name_constraints(path) {
+        return fail(&detail);
+    }
+    if let Some(policy) = store.required_policy {
+        if let Err(detail) = check_required_policy(path, policy) {
+            return fail(&detail);
+        }
+    }
+    let anchor = path.last().expect("non-empty path");
+    if path.len() == 1 {
+        ok("certificate is a trusted root")
+    } else {
+        ok(&format!("chains to trusted root ({})", dn(anchor)))
+    }
+}
+
+// --- RFC 5280 name constraints (§4.2.1.10) -----------------------------------
+
+/// Apply name constraints down the path: each certificate must satisfy the
+/// constraints imposed by every CA above it. `path` is `[leaf, ..., root]`.
+fn check_name_constraints(path: &[Certificate]) -> std::result::Result<(), String> {
+    let mut collected: Vec<NameConstraints> = Vec::new();
+    // Walk from the root (trust anchor, unchecked) down to the leaf.
+    for (i, cert) in path.iter().enumerate().rev() {
+        let is_anchor = i == path.len() - 1;
+        if !is_anchor {
+            for name in cert_names(cert) {
+                for nc in &collected {
+                    if name_excluded(&name, nc) {
+                        return Err("subject name excluded by a CA name constraint".into());
+                    }
+                    if !name_permitted(&name, nc) {
+                        return Err("subject name outside a CA's permitted name constraints".into());
+                    }
+                }
+            }
+        }
+        if let Ok(Some((_, nc))) = cert.tbs_certificate.get::<NameConstraints>() {
+            collected.push(nc);
+        }
+    }
+    Ok(())
+}
+
+/// The constrained names of a certificate: its subject DN plus any SANs.
+fn cert_names(cert: &Certificate) -> Vec<GeneralName> {
+    let mut names = vec![GeneralName::DirectoryName(cert.tbs_certificate.subject.clone())];
+    if let Ok(Some((_, san))) = cert.tbs_certificate.get::<SubjectAltName>() {
+        names.extend(san.0.iter().cloned());
+    }
+    names
+}
+
+fn name_excluded(name: &GeneralName, nc: &NameConstraints) -> bool {
+    nc.excluded_subtrees
+        .as_ref()
+        .is_some_and(|subs| subs.iter().any(|s| within_subtree(name, &s.base) == Some(true)))
+}
+
+fn name_permitted(name: &GeneralName, nc: &NameConstraints) -> bool {
+    let Some(subs) = &nc.permitted_subtrees else {
+        return true; // no permitted constraint
+    };
+    // Only subtrees of the same type as `name` constrain it.
+    let same_type: Vec<_> = subs
+        .iter()
+        .filter(|s| within_subtree(name, &s.base).is_some())
+        .collect();
+    if same_type.is_empty() {
+        return true; // this type is unconstrained by permittedSubtrees
+    }
+    same_type
+        .iter()
+        .any(|s| within_subtree(name, &s.base) == Some(true))
+}
+
+/// `Some(true/false)` when `name` and `base` are the same GeneralName type
+/// (matched or not), `None` when the types differ (constraint not applicable).
+fn within_subtree(name: &GeneralName, base: &GeneralName) -> Option<bool> {
+    match (name, base) {
+        (GeneralName::DirectoryName(n), GeneralName::DirectoryName(b)) => Some(dn_within(n, b)),
+        (GeneralName::DnsName(n), GeneralName::DnsName(b)) => {
+            Some(dns_within(n.as_str(), b.as_str()))
+        }
+        (GeneralName::Rfc822Name(n), GeneralName::Rfc822Name(b)) => {
+            Some(email_within(n.as_str(), b.as_str()))
+        }
+        (GeneralName::IpAddress(n), GeneralName::IpAddress(b)) => {
+            Some(ip_within(n.as_bytes(), b.as_bytes()))
+        }
+        (GeneralName::UniformResourceIdentifier(n), GeneralName::UniformResourceIdentifier(b)) => {
+            Some(dns_within(uri_host(n.as_str()), b.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// A DN is within a base subtree if the base RDN sequence is a prefix of it.
+fn dn_within(name: &Name, base: &Name) -> bool {
+    if base.0.len() > name.0.len() {
+        return false;
+    }
+    base.0
+        .iter()
+        .zip(name.0.iter())
+        .all(|(b, n)| b.to_der().ok() == n.to_der().ok())
+}
+
+fn dns_within(name: &str, base: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let b = base.trim_start_matches('.').to_ascii_lowercase();
+    if b.is_empty() {
+        return true;
+    }
+    n == b || n.ends_with(&format!(".{b}"))
+}
+
+fn email_within(name: &str, base: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let b = base.to_ascii_lowercase();
+    if b.contains('@') {
+        return n == b;
+    }
+    let host = n.split('@').nth(1).unwrap_or(&n);
+    dns_within(host, &b)
+}
+
+fn ip_within(name: &[u8], base: &[u8]) -> bool {
+    // base is address || mask (8 bytes for IPv4, 32 for IPv6).
+    if base.len() != name.len() * 2 {
+        return false;
+    }
+    let (net, mask) = base.split_at(name.len());
+    name.iter()
+        .zip(net)
+        .zip(mask)
+        .all(|((nb, ab), mb)| (nb & mb) == (ab & mb))
+}
+
+fn uri_host(uri: &str) -> &str {
+    let after_scheme = uri.split("://").nth(1).unwrap_or(uri);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    host.split(':').next().unwrap_or(host)
+}
+
+// --- Certificate policies (practical subset of RFC 5280 §6.1) ----------------
+
+/// The leaf — and every intermediate carrying a policies extension — must
+/// assert `required` (or `anyPolicy`). This is a subset: no policy mapping or
+/// `valid_policy_tree` processing.
+fn check_required_policy(
+    path: &[Certificate],
+    required: ObjectIdentifier,
+) -> std::result::Result<(), String> {
+    let leaf = &path[0];
+    if !asserts_policy(leaf, required) {
+        return Err("leaf does not assert the required certificate policy".into());
+    }
+    // Intermediates (exclude the root anchor at the end).
+    for cert in &path[1..path.len().saturating_sub(1)] {
+        if let Ok(Some((_, pols))) = cert.tbs_certificate.get::<CertificatePolicies>() {
+            if !policy_set_allows(&pols, required) {
+                return Err("an intermediate CA does not allow the required policy".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn asserts_policy(cert: &Certificate, required: ObjectIdentifier) -> bool {
+    match cert.tbs_certificate.get::<CertificatePolicies>() {
+        Ok(Some((_, pols))) => policy_set_allows(&pols, required),
+        _ => false,
+    }
+}
+
+fn policy_set_allows(pols: &CertificatePolicies, required: ObjectIdentifier) -> bool {
+    pols.0
+        .iter()
+        .any(|p| p.policy_identifier == required || p.policy_identifier == ANY_POLICY)
 }
 
 /// True if an OCSP response marks `cert` (under `issuer`) as revoked.

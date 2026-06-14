@@ -1,6 +1,6 @@
 use pdf_signer::testkit::{
-    ca_chain3_p12, ca_signed_p12, sample_pdf, self_signed_p12, self_signed_p256_p12,
-    self_signed_p384_p12,
+    ca_chain3_p12, ca_name_constrained_p12, ca_signed_p12, ca_with_policy_p12, sample_pdf,
+    self_signed_p12, self_signed_p256_p12, self_signed_p384_p12,
 };
 use pdf_signer::{
     sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
@@ -262,6 +262,59 @@ fn ecdsa_p384_sign_and_verify() {
     let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("P-384 sign");
     let report = verify_pdf_bytes(&signed).expect("verify");
     assert!(report.signatures[0].valid, "{}", report.signatures[0].detail);
+}
+
+#[test]
+fn name_constraint_permitted_is_trusted() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_name_constrained_p12("pw", false); // permitted = leaf DN
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+    let store = TrustStore::from_ders([root_der]).expect("store");
+    let report = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert_eq!(
+        report.signatures[0].chain_trusted,
+        Some(true),
+        "{}",
+        report.signatures[0].detail
+    );
+}
+
+#[test]
+fn name_constraint_excluded_is_rejected() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_name_constrained_p12("pw", true); // excluded = leaf DN
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+    let store = TrustStore::from_ders([root_der]).expect("store");
+    let report = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert_eq!(report.signatures[0].chain_trusted, Some(false));
+    assert!(report.signatures[0].detail.contains("excluded"));
+}
+
+#[test]
+fn required_policy_present_and_absent() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_with_policy_p12("pw", "1.3.6.1.4.1.99999.1");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // The leaf asserts the required policy -> trusted.
+    let store = TrustStore::from_ders([root_der.clone()])
+        .unwrap()
+        .require_policy("1.3.6.1.4.1.99999.1")
+        .unwrap();
+    assert_eq!(
+        verify_pdf_bytes_with_roots(&signed, &store).unwrap().signatures[0].chain_trusted,
+        Some(true)
+    );
+
+    // A different required policy -> rejected.
+    let store2 = TrustStore::from_ders([root_der])
+        .unwrap()
+        .require_policy("1.3.6.1.4.1.99999.2")
+        .unwrap();
+    assert_eq!(
+        verify_pdf_bytes_with_roots(&signed, &store2).unwrap().signatures[0].chain_trusted,
+        Some(false)
+    );
 }
 
 #[test]

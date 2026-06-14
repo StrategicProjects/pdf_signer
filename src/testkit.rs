@@ -10,6 +10,7 @@ use std::time::Duration;
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 
+use const_oid::ObjectIdentifier;
 use der::Encode;
 use p12_keystore::{Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
 use rsa::pkcs1v15::{Signature, SigningKey};
@@ -226,6 +227,135 @@ pub fn ca_signed_p12(password: &str) -> (Vec<u8>, Vec<u8>) {
     let mut ks = KeyStore::new();
     ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
     (ks.writer(password).write().expect("write p12"), root_der)
+}
+
+/// Root CA that name-constrains the leaf's exact DN — permitted (`excluded` =
+/// false) or excluded (true). Returns `(p12, root_cert_der)`.
+pub fn ca_name_constrained_p12(password: &str, excluded: bool) -> (Vec<u8>, Vec<u8>) {
+    use x509_cert::ext::pkix::constraints::name::GeneralSubtree;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::NameConstraints;
+
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap();
+    let root_name = Name::from_str("CN=NC Root,O=StrategicProjects,C=BR").unwrap();
+    let leaf_name = Name::from_str("CN=NC Leaf,O=StrategicProjects,C=BR").unwrap();
+
+    let subtree = GeneralSubtree {
+        base: GeneralName::DirectoryName(leaf_name.clone()),
+        minimum: 0,
+        maximum: None,
+    };
+    let nc = if excluded {
+        NameConstraints {
+            permitted_subtrees: None,
+            excluded_subtrees: Some(vec![subtree]),
+        }
+    } else {
+        NameConstraints {
+            permitted_subtrees: Some(vec![subtree]),
+            excluded_subtrees: None,
+        }
+    };
+
+    let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let root_signing = SigningKey::<Sha256>::new(root_key);
+    let mut root_builder = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        root_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(root_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap();
+    root_builder.add_extension(&nc).unwrap();
+    let root_cert = root_builder.build::<Signature>().unwrap();
+    let root_der = root_cert.to_der().unwrap();
+
+    let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let leaf_signing = SigningKey::<Sha256>::new(leaf_key.clone());
+    let leaf_cert = CertificateBuilder::new(
+        leaf_profile(root_name),
+        SerialNumber::from(2u32),
+        validity,
+        leaf_name,
+        SubjectPublicKeyInfoOwned::from_key(leaf_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap();
+    let p12 = leaf_p12(password, &leaf_key, &leaf_cert.to_der().unwrap(), &root_der);
+    (p12, root_der)
+}
+
+/// Root CA + leaf where the leaf asserts `policy_oid`. Returns `(p12, root_der)`.
+pub fn ca_with_policy_p12(password: &str, policy_oid: &str) -> (Vec<u8>, Vec<u8>) {
+    use x509_cert::ext::pkix::certpolicy::PolicyInformation;
+    use x509_cert::ext::pkix::CertificatePolicies;
+
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap();
+    let root_name = Name::from_str("CN=Policy Root,O=StrategicProjects,C=BR").unwrap();
+
+    let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let root_signing = SigningKey::<Sha256>::new(root_key);
+    let root_cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        root_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(root_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap();
+    let root_der = root_cert.to_der().unwrap();
+
+    let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let leaf_signing = SigningKey::<Sha256>::new(leaf_key.clone());
+    let pols = CertificatePolicies(vec![PolicyInformation {
+        policy_identifier: ObjectIdentifier::new(policy_oid).unwrap(),
+        policy_qualifiers: None,
+    }]);
+    let mut leaf_builder = CertificateBuilder::new(
+        leaf_profile(root_name),
+        SerialNumber::from(2u32),
+        validity,
+        Name::from_str("CN=Policy Leaf,O=StrategicProjects,C=BR").unwrap(),
+        SubjectPublicKeyInfoOwned::from_key(leaf_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap();
+    leaf_builder.add_extension(&pols).unwrap();
+    let leaf_cert = leaf_builder.build::<Signature>().unwrap();
+    let p12 = leaf_p12(password, &leaf_key, &leaf_cert.to_der().unwrap(), &root_der);
+    (p12, root_der)
+}
+
+fn leaf_profile(issuer: Name) -> Profile {
+    Profile::Leaf {
+        issuer,
+        enable_key_agreement: false,
+        enable_key_encipherment: true,
+    }
+}
+
+fn leaf_p12(password: &str, leaf_key: &RsaPrivateKey, leaf_der: &[u8], root_der: &[u8]) -> Vec<u8> {
+    let key_der = leaf_key.to_pkcs8_der().unwrap().as_bytes().to_vec();
+    let chain = PrivateKeyChain::new(
+        &key_der,
+        b"poc",
+        vec![
+            P12Certificate::from_der(leaf_der).unwrap(),
+            P12Certificate::from_der(root_der).unwrap(),
+        ],
+    );
+    let mut ks = KeyStore::new();
+    ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
+    ks.writer(password).write().unwrap()
 }
 
 /// Build a three-level PKI (root CA → intermediate CA → leaf). Returns
