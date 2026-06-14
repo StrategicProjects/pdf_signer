@@ -6,6 +6,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::crypto::cms_sign;
 use crate::error::Error;
+use crate::incremental::{last_startxref, Incremental};
 use crate::util::{find_sub, hex_encode};
 use crate::Result;
 
@@ -106,25 +107,22 @@ pub fn sign_pdf_bytes(
     password: &str,
     opts: &SignOptions,
 ) -> Result<Vec<u8>> {
-    // 1. Lay out the signature dictionary + field with placeholders.
-    let mut doc = Document::load_mem(pdf)?;
-    let page = opts.appearance.as_ref().map(|a| a.page).unwrap_or(1);
-    let field_id = add_signature_field(&mut doc, opts)?;
-    attach_field_to_page(&mut doc, field_id, page)?;
-    set_acroform(&mut doc, field_id)?;
+    // 1. Build an incremental update (keeps the original bytes verbatim, so any
+    //    prior signature stays valid).
+    let mut buf = build_incremental_update(pdf, opts)?;
 
-    // 2. Serialize once; from here byte offsets are stable.
-    let mut buf = Vec::new();
-    doc.save_to(&mut buf)?;
+    // Our new placeholders live in the appended region; search from there so we
+    // never hit a previous signature's already-filled /ByteRange or /Contents.
+    let search_from = pdf.len();
 
     // 3. Locate the /Contents placeholder (the hex string of zeros).
-    let (lt, gt) = locate_contents_placeholder(&buf, opts.signature_capacity)?;
+    let (lt, gt) = locate_contents_placeholder(&buf, opts.signature_capacity, search_from)?;
     let p = lt; // index of '<'
     let q = gt + 1; // index just after '>'
     let total = buf.len();
 
     // 4. Patch the /ByteRange in place (length-preserving, so p/q stay valid).
-    patch_byte_range(&mut buf, p as i64, q as i64, (total - q) as i64)?;
+    patch_byte_range(&mut buf, search_from, p as i64, q as i64, (total - q) as i64)?;
 
     // 5. Build the detached CMS over everything except the Contents hole.
     let mut signed_bytes = Vec::with_capacity(p + (total - q));
@@ -150,15 +148,56 @@ pub fn sign_pdf_bytes(
     Ok(buf)
 }
 
-/// Create the signature `/Sig` object and a `/FT /Sig` widget field that
-/// references it. Returns the field (widget) object id.
-fn add_signature_field(doc: &mut Document, opts: &SignOptions) -> Result<ObjectId> {
+/// Assemble the incremental-update section (with signature placeholders) and
+/// return `original_bytes + update`.
+fn build_incremental_update(pdf: &[u8], opts: &SignOptions) -> Result<Vec<u8>> {
+    let doc = Document::load_mem(pdf)?;
+    let root_id = doc.trailer.get(b"Root")?.as_reference()?;
+    let page_number = opts.appearance.as_ref().map(|a| a.page).unwrap_or(1);
+    let page_id = nth_page_id(&doc, page_number)?;
+
+    let mut inc = Incremental::new(pdf);
+    let mut next_id = doc.max_id + 1;
+    let mut alloc = || {
+        let id = (next_id, 0u16);
+        next_id += 1;
+        id
+    };
+
+    let sig_id = alloc();
+    inc.add(sig_id, build_sig_dict(opts));
+
+    // Optional visible appearance: font + Form XObject.
+    let mut ap_ref = None;
+    if let Some(app) = &opts.appearance {
+        let font_id = alloc();
+        inc.add(font_id, build_font_dict());
+        let xobj_id = alloc();
+        inc.add(xobj_id, build_appearance_xobject(app, font_id));
+        ap_ref = Some(xobj_id);
+    }
+
+    let widget_id = alloc();
+    inc.add(widget_id, build_widget(opts, sig_id, ap_ref));
+
+    apply_widget_to_page(&doc, &mut inc, page_id, widget_id)?;
+    apply_field_to_acroform(&doc, &mut inc, root_id, widget_id)?;
+
+    let size = next_id; // highest object id allocated + 1
+    let prev = last_startxref(pdf)
+        .ok_or_else(|| Error::Malformed("original PDF has no startxref".into()))?;
+    let id_array = doc.trailer.get(b"ID").ok().cloned();
+
+    Ok(inc.render(size, root_id, prev, id_array))
+}
+
+/// The signature `/Sig` dictionary, with ByteRange/Contents placeholders.
+fn build_sig_dict(opts: &SignOptions) -> Object {
     let mut sig = Dictionary::new();
     sig.set("Type", Object::Name(b"Sig".to_vec()));
     sig.set("Filter", Object::Name(b"Adobe.PPKLite".to_vec()));
     sig.set("SubFilter", Object::Name(b"adbe.pkcs7.detached".to_vec()));
-    // Placeholders patched after serialization. Ten-digit sentinels reserve
-    // enough width for any realistic file offset.
+    // Ten-digit sentinels reserve enough width for any realistic file offset.
     sig.set(
         "ByteRange",
         Object::Array(vec![
@@ -187,27 +226,26 @@ fn add_signature_field(doc: &mut Document, opts: &SignOptions) -> Result<ObjectI
     if let Some(t) = &opts.signing_time {
         sig.set("M", Object::string_literal(t.clone()));
     }
-    let sig_id = doc.add_object(Object::Dictionary(sig));
+    Object::Dictionary(sig)
+}
 
-    // Build the visible appearance stream first (if any), so we can reference it.
-    let appearance = opts
-        .appearance
-        .as_ref()
-        .map(|app| build_appearance_xobject(doc, app))
-        .transpose()?;
-
+/// The `/FT /Sig` widget annotation referencing the signature dictionary.
+fn build_widget(opts: &SignOptions, sig_id: ObjectId, ap_ref: Option<ObjectId>) -> Object {
     let mut field = Dictionary::new();
     field.set("Type", Object::Name(b"Annot".to_vec()));
     field.set("Subtype", Object::Name(b"Widget".to_vec()));
     field.set("FT", Object::Name(b"Sig".to_vec()));
-    field.set("T", Object::string_literal("Signature1"));
+    // Field name must be unique across (re-)signatures; key it to the sig id.
+    field.set("T", Object::string_literal(format!("Signature{}", sig_id.0)));
     field.set("F", Object::Integer(132)); // Print | Locked
     field.set("V", Object::Reference(sig_id));
 
-    match (&opts.appearance, appearance) {
+    match (&opts.appearance, ap_ref) {
         (Some(app), Some(ap_id)) => {
-            let rect = rect_array(app.x, app.y, app.x + app.width, app.y + app.height);
-            field.set("Rect", rect);
+            field.set(
+                "Rect",
+                rect_array(app.x, app.y, app.x + app.width, app.y + app.height),
+            );
             let mut ap = Dictionary::new();
             ap.set("N", Object::Reference(ap_id));
             field.set("AP", Object::Dictionary(ap));
@@ -217,9 +255,34 @@ fn add_signature_field(doc: &mut Document, opts: &SignOptions) -> Result<ObjectI
             field.set("Rect", rect_array(0.0, 0.0, 0.0, 0.0));
         }
     }
+    Object::Dictionary(field)
+}
 
-    let field_id = doc.add_object(Object::Dictionary(field));
-    Ok(field_id)
+/// A standard Helvetica font dictionary (WinAnsi) for the appearance.
+fn build_font_dict() -> Object {
+    let mut f = Dictionary::new();
+    f.set("Type", Object::Name(b"Font".to_vec()));
+    f.set("Subtype", Object::Name(b"Type1".to_vec()));
+    f.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+    f.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
+    Object::Dictionary(f)
+}
+
+/// The appearance Form XObject (`/AP /N` stream).
+fn build_appearance_xobject(app: &Appearance, font_id: ObjectId) -> Object {
+    let mut fonts = Dictionary::new();
+    fonts.set("Helv", Object::Reference(font_id));
+    let mut resources = Dictionary::new();
+    resources.set("Font", Object::Dictionary(fonts));
+
+    let mut xobj = Dictionary::new();
+    xobj.set("Type", Object::Name(b"XObject".to_vec()));
+    xobj.set("Subtype", Object::Name(b"Form".to_vec()));
+    xobj.set("FormType", Object::Integer(1));
+    xobj.set("BBox", rect_array(0.0, 0.0, app.width, app.height));
+    xobj.set("Resources", Object::Dictionary(resources));
+
+    Object::Stream(lopdf::Stream::new(xobj, build_appearance_content(app)))
 }
 
 fn rect_array(x1: f64, y1: f64, x2: f64, y2: f64) -> Object {
@@ -231,34 +294,113 @@ fn rect_array(x1: f64, y1: f64, x2: f64, y2: f64) -> Object {
     ])
 }
 
-/// Build the appearance Form XObject (with a Helvetica font resource) and add
-/// it to the document. Returns its object id.
-fn build_appearance_xobject(doc: &mut Document, app: &Appearance) -> Result<ObjectId> {
-    let font_id = doc.add_object({
-        let mut f = Dictionary::new();
-        f.set("Type", Object::Name(b"Font".to_vec()));
-        f.set("Subtype", Object::Name(b"Type1".to_vec()));
-        f.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
-        f.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
-        Object::Dictionary(f)
-    });
+/// First object id of page `page_number` (1-based), falling back to page 1.
+fn nth_page_id(doc: &Document, page_number: usize) -> Result<ObjectId> {
+    let pages = doc.get_pages();
+    pages
+        .get(&(page_number as u32))
+        .copied()
+        .or_else(|| pages.values().next().copied())
+        .ok_or_else(|| Error::Malformed("PDF has no pages".into()))
+}
 
-    let content = build_appearance_content(app);
+/// Add the widget to the target page's `/Annots`, re-emitting only what changed.
+fn apply_widget_to_page(
+    doc: &Document,
+    inc: &mut Incremental,
+    page_id: ObjectId,
+    widget_id: ObjectId,
+) -> Result<()> {
+    let page = doc.get_object(page_id)?.as_dict()?;
+    let widget_ref = Object::Reference(widget_id);
+    match page.get(b"Annots") {
+        Ok(Object::Reference(r)) => {
+            // Annots is its own object — modify just that array.
+            let r = *r;
+            let mut arr = doc.get_object(r)?.as_array()?.clone();
+            arr.push(widget_ref);
+            inc.add(r, Object::Array(arr));
+        }
+        Ok(Object::Array(a)) => {
+            let mut page = page.clone();
+            let mut arr = a.clone();
+            arr.push(widget_ref);
+            page.set("Annots", Object::Array(arr));
+            inc.add(page_id, Object::Dictionary(page));
+        }
+        _ => {
+            let mut page = page.clone();
+            page.set("Annots", Object::Array(vec![widget_ref]));
+            inc.add(page_id, Object::Dictionary(page));
+        }
+    }
+    Ok(())
+}
 
-    let mut resources = Dictionary::new();
-    let mut fonts = Dictionary::new();
-    fonts.set("Helv", Object::Reference(font_id));
-    resources.set("Font", Object::Dictionary(fonts));
+/// Register the field in `/AcroForm` (creating it if absent), re-emitting only
+/// the object that actually changes.
+fn apply_field_to_acroform(
+    doc: &Document,
+    inc: &mut Incremental,
+    root_id: ObjectId,
+    widget_id: ObjectId,
+) -> Result<()> {
+    let catalog = doc.get_object(root_id)?.as_dict()?;
+    let widget_ref = Object::Reference(widget_id);
 
-    let mut xobj = Dictionary::new();
-    xobj.set("Type", Object::Name(b"XObject".to_vec()));
-    xobj.set("Subtype", Object::Name(b"Form".to_vec()));
-    xobj.set("FormType", Object::Integer(1));
-    xobj.set("BBox", rect_array(0.0, 0.0, app.width, app.height));
-    xobj.set("Resources", Object::Dictionary(resources));
+    match catalog.get(b"AcroForm") {
+        Ok(Object::Reference(af)) => {
+            let af = *af;
+            let mut form = doc.get_object(af)?.as_dict()?.clone();
+            add_field_to_form(doc, inc, &mut form, widget_ref)?;
+            form.set("SigFlags", Object::Integer(3));
+            inc.add(af, Object::Dictionary(form));
+        }
+        Ok(Object::Dictionary(d)) => {
+            let mut catalog = catalog.clone();
+            let mut form = d.clone();
+            add_field_to_form(doc, inc, &mut form, widget_ref)?;
+            form.set("SigFlags", Object::Integer(3));
+            catalog.set("AcroForm", Object::Dictionary(form));
+            inc.add(root_id, Object::Dictionary(catalog));
+        }
+        _ => {
+            let mut catalog = catalog.clone();
+            let mut form = Dictionary::new();
+            form.set("Fields", Object::Array(vec![widget_ref]));
+            form.set("SigFlags", Object::Integer(3));
+            catalog.set("AcroForm", Object::Dictionary(form));
+            inc.add(root_id, Object::Dictionary(catalog));
+        }
+    }
+    Ok(())
+}
 
-    let stream = lopdf::Stream::new(xobj, content);
-    Ok(doc.add_object(Object::Stream(stream)))
+/// Append `widget_ref` to a form's `/Fields`, handling both an inline array and
+/// a referenced array object.
+fn add_field_to_form(
+    doc: &Document,
+    inc: &mut Incremental,
+    form: &mut Dictionary,
+    widget_ref: Object,
+) -> Result<()> {
+    match form.get(b"Fields") {
+        Ok(Object::Reference(fr)) => {
+            let fr = *fr;
+            let mut arr = doc.get_object(fr)?.as_array()?.clone();
+            arr.push(widget_ref);
+            inc.add(fr, Object::Array(arr));
+        }
+        Ok(Object::Array(a)) => {
+            let mut arr = a.clone();
+            arr.push(widget_ref);
+            form.set("Fields", Object::Array(arr));
+        }
+        _ => {
+            form.set("Fields", Object::Array(vec![widget_ref]));
+        }
+    }
+    Ok(())
 }
 
 /// Render the appearance content stream: optional border + wrapped text.
@@ -356,63 +498,17 @@ fn wrap_text(text: &str, max_width: f64, font_size: f64) -> Vec<String> {
     out
 }
 
-/// Append the widget reference to the `/Annots` of page `page_number` (1-based),
-/// falling back to the first page.
-fn attach_field_to_page(doc: &mut Document, field_id: ObjectId, page_number: usize) -> Result<()> {
-    let pages = doc.get_pages();
-    let page_id = pages
-        .get(&(page_number as u32))
-        .copied()
-        .or_else(|| pages.values().next().copied())
-        .ok_or_else(|| Error::Malformed("PDF has no pages".into()))?;
-
-    enum Kind {
-        RefArray(ObjectId),
-        Inline,
-        None,
-    }
-    let kind = {
-        let page = doc.get_object(page_id)?.as_dict()?;
-        match page.get(b"Annots") {
-            Ok(Object::Reference(r)) => Kind::RefArray(*r),
-            Ok(Object::Array(_)) => Kind::Inline,
-            _ => Kind::None,
-        }
-    };
-    let field_ref = Object::Reference(field_id);
-    match kind {
-        Kind::RefArray(r) => doc.get_object_mut(r)?.as_array_mut()?.push(field_ref),
-        Kind::Inline => doc
-            .get_object_mut(page_id)?
-            .as_dict_mut()?
-            .get_mut(b"Annots")?
-            .as_array_mut()?
-            .push(field_ref),
-        Kind::None => doc
-            .get_object_mut(page_id)?
-            .as_dict_mut()?
-            .set("Annots", Object::Array(vec![field_ref])),
-    }
-    Ok(())
-}
-
-/// Register the field in the document catalog `/AcroForm` and flag it as signed.
-fn set_acroform(doc: &mut Document, field_id: ObjectId) -> Result<()> {
-    let root_id = doc.trailer.get(b"Root")?.as_reference()?;
-    let mut acro = Dictionary::new();
-    acro.set("Fields", Object::Array(vec![Object::Reference(field_id)]));
-    acro.set("SigFlags", Object::Integer(3)); // SignaturesExist | AppendOnly
-    doc.get_object_mut(root_id)?
-        .as_dict_mut()?
-        .set("AcroForm", Object::Dictionary(acro));
-    Ok(())
-}
-
-/// Find the `< 00..00 >` placeholder, returning the `<` and `>` indices.
-fn locate_contents_placeholder(buf: &[u8], capacity: usize) -> Result<(usize, usize)> {
+/// Find the `< 00..00 >` placeholder at or after `start`, returning the `<` and
+/// `>` indices. `start` skips any prior (already-filled) signature.
+fn locate_contents_placeholder(
+    buf: &[u8],
+    capacity: usize,
+    start: usize,
+) -> Result<(usize, usize)> {
     // Search after /ByteRange so we never collide with a page's /Contents.
-    let br = find_sub(buf, b"/ByteRange")
-        .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
+    let br = start
+        + find_sub(&buf[start..], b"/ByteRange")
+            .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
     let rel = find_sub(&buf[br..], b"/Contents")
         .ok_or_else(|| Error::Malformed("/Contents not found".into()))?;
     let from = br + rel;
@@ -428,11 +524,12 @@ fn locate_contents_placeholder(buf: &[u8], capacity: usize) -> Result<(usize, us
     Ok((lt, gt))
 }
 
-/// Replace the `/ByteRange [...]` array with concrete offsets, padding with
-/// spaces so the byte length is unchanged.
-fn patch_byte_range(buf: &mut [u8], a: i64, b: i64, c: i64) -> Result<()> {
-    let br = find_sub(buf, b"/ByteRange")
-        .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
+/// Replace the `/ByteRange [...]` array (at or after `start`) with concrete
+/// offsets, padding with spaces so the byte length is unchanged.
+fn patch_byte_range(buf: &mut [u8], start: usize, a: i64, b: i64, c: i64) -> Result<()> {
+    let br = start
+        + find_sub(&buf[start..], b"/ByteRange")
+            .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
     let open = br + find_sub(&buf[br..], b"[")
         .ok_or_else(|| Error::Malformed("ByteRange '[' not found".into()))?;
     let close = open

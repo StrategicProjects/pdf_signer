@@ -47,16 +47,31 @@ sign_pdf_file("in.pdf", "out.pdf", "keystore.p12", "password", &SignOptions {
 })?;
 ```
 
+Signing uses a true **incremental update**: the original bytes are kept
+verbatim and the new objects + xref are appended. This means **multiple
+signatures** are supported — signing again does not invalidate earlier
+signatures, which keep covering their original (unchanged) byte range:
+
+```text
+$ pdf_signer sign  in.pdf   s1.pdf keystore.p12 pw "First"
+$ pdf_signer sign  s1.pdf   s2.pdf keystore.p12 pw "Second"   # appends only
+$ pdfsig s2.pdf
+  Signature #1: Signature is Valid.
+  Signature #2: Total document signed — Signature is Valid.
+```
+
 `cargo test` covers the round trip, tamper detection, the visible appearance,
-and the unsigned case.
+incremental-update byte preservation, multi-signature, and the unsigned case.
 
 ## How it works
 
 1. **PDF structure** (`lopdf`): add an AcroForm signature field + a `/Sig`
    dictionary with `/SubFilter /adbe.pkcs7.detached`, a `/ByteRange` placeholder
    and a zero-filled `/Contents` hex placeholder.
-2. **Byte surgery**: serialize once, locate the placeholder, compute the real
-   `/ByteRange` and patch it length-preservingly.
+2. **Incremental update** (`incremental.rs`): the original file is left byte-for-byte
+   intact; the signature objects, a fresh xref table and a `/Prev`-chained
+   trailer are appended. Then byte surgery locates the placeholder (within the
+   appended region), computes the real `/ByteRange` and patches it length-preservingly.
 3. **CMS signature** (`cms` + `rsa` + `sha2`, RustCrypto): load the PKCS#12
    (`p12-keystore`), build a detached CMS SignedData with `messageDigest`,
    `contentType` and `signingTime` signed attributes, RSA-sign it, and
@@ -86,10 +101,13 @@ assert!(report.all_valid());
 - **Basic appearance.** Visible signatures use the standard Helvetica font with
   approximate (character-count) line wrapping and WinAnsi encoding, so glyphs
   outside Latin-1 become `?`. No logo/image support yet.
-- **Full-rewrite save**, not an incremental update. Fine for a first signature;
-  must become an append-only incremental update before multi-signature support.
 - **RSA keys only.** The signer assumes RSA (PKCS#1 v1.5 + SHA-256). ECDSA /
   Ed25519 keystores are not handled yet.
+- **Incremental update uses a traditional xref table.** It chains via `/Prev`
+  to the previous section (table or stream), which 1.5+ readers accept; an
+  xref-*stream* output is not produced. Existing referenced `/AcroForm` /
+  `/Annots` / `/Fields` objects are handled, but exotic shared structures may
+  need more care.
 - **No PAdES-LTV / timestamps (RFC 3161)** and no certificate chain / revocation
   checking on verify; the signer DN is reported but trust is not enforced.
 - Single signature parsed on verify; AcroForm is overwritten rather than merged.
@@ -98,7 +116,7 @@ assert!(report.all_valid());
 
 1. ~~Swap OpenSSL → RustCrypto~~ ✅ done — pure-Rust `cms`/`rsa`/`p12-keystore`.
 2. ~~Visual appearance stream (`signtext` box + validation link)~~ ✅ done.
-3. Incremental-update save for multi-signature / re-signing.
+3. ~~Incremental-update save for multi-signature / re-signing~~ ✅ done.
 4. Vendor crates for an R package build (`SystemRequirements: Cargo, rustc`).
 5. Expose to R: either a thin CLI invoked via `system2`, or a native binding
    (e.g. via `extendr`) compiled into the package.

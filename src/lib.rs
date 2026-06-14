@@ -22,6 +22,7 @@
 
 mod crypto;
 mod error;
+mod incremental;
 mod sign;
 pub mod testkit;
 mod util;

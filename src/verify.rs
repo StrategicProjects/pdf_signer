@@ -43,12 +43,20 @@ pub fn verify_pdf_file(path: impl AsRef<Path>) -> Result<SignatureReport> {
     verify_pdf_bytes(&pdf)
 }
 
-/// Verify the signatures of an in-memory PDF.
+/// Verify all signatures of an in-memory PDF (one per `/ByteRange`).
 pub fn verify_pdf_bytes(pdf: &[u8]) -> Result<SignatureReport> {
-    let br = match find_sub(pdf, b"/ByteRange") {
-        Some(i) => i,
-        None => return Ok(SignatureReport { signatures: vec![] }),
-    };
+    let mut signatures = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = find_sub(&pdf[from..], b"/ByteRange") {
+        let br = from + rel;
+        from = br + b"/ByteRange".len();
+        signatures.push(verify_one(pdf, br)?);
+    }
+    Ok(SignatureReport { signatures })
+}
+
+/// Verify the single signature whose `/ByteRange` begins at `br`.
+fn verify_one(pdf: &[u8], br: usize) -> Result<VerifiedSignature> {
     let byte_range = parse_byte_range(&pdf[br..])?;
     let der = extract_cms(pdf, br)?;
 
@@ -72,15 +80,13 @@ pub fn verify_pdf_bytes(pdf: &[u8]) -> Result<SignatureReport> {
         Err(e) => (false, None, format!("{e}")),
     };
 
-    Ok(SignatureReport {
-        signatures: vec![VerifiedSignature {
-            valid,
-            byte_range,
-            signed_len: l1 + l2,
-            covers_whole_document,
-            signer,
-            detail,
-        }],
+    Ok(VerifiedSignature {
+        valid,
+        byte_range,
+        signed_len: l1 + l2,
+        covers_whole_document,
+        signer,
+        detail,
     })
 }
 

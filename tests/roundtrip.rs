@@ -76,6 +76,46 @@ fn visible_appearance_round_trip() {
 }
 
 #[test]
+fn incremental_update_preserves_original_bytes() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+    // An incremental update appends; the original is an exact byte prefix.
+    assert!(signed.len() > pdf.len());
+    assert_eq!(&signed[..pdf.len()], &pdf[..], "original bytes must be intact");
+    assert!(contains(&signed, b"/Prev"), "update trailer should chain /Prev");
+}
+
+#[test]
+fn second_signature_keeps_the_first_valid() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+
+    let first = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions {
+        reason: Some("Primeira".into()),
+        ..Default::default()
+    })
+    .expect("first sign");
+
+    let second = sign_pdf_bytes(&first, &p12, "pw", &SignOptions {
+        reason: Some("Segunda".into()),
+        ..Default::default()
+    })
+    .expect("second sign");
+
+    // The first signed file is preserved verbatim as a prefix of the second.
+    assert_eq!(&second[..first.len()], &first[..], "first signature bytes intact");
+
+    let report = verify_pdf_bytes(&second).expect("verify");
+    assert_eq!(report.signatures.len(), 2, "two signatures expected");
+    assert!(report.all_valid(), "both signatures must verify");
+
+    // The earlier signature covers the doc as it was; the later one covers all.
+    assert!(!report.signatures[0].covers_whole_document);
+    assert!(report.signatures[1].covers_whole_document);
+}
+
+#[test]
 fn unsigned_document_reports_no_signatures() {
     let pdf = sample_pdf();
     let report = verify_pdf_bytes(&pdf).expect("verify failed");
