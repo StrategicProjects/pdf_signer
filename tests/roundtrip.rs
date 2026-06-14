@@ -1,5 +1,8 @@
-use pdf_signer::testkit::{sample_pdf, self_signed_p12};
-use pdf_signer::{sign_pdf_bytes, verify_pdf_bytes, Appearance, PadesLevel, SignOptions};
+use pdf_signer::testkit::{ca_signed_p12, sample_pdf, self_signed_p12};
+use pdf_signer::{
+    sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
+    SignOptions, TrustStore,
+};
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
@@ -169,6 +172,35 @@ fn pades_blta_builds_dss_and_document_timestamp() {
     assert_eq!(report.signatures.len(), 2, "signature + document timestamp");
     assert!(report.all_valid(), "both must validate");
     assert!(report.signatures[1].detail.contains("timestamp"));
+}
+
+#[test]
+fn chain_validates_against_trusted_root() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // Trusted: the issuing root is in the store.
+    let store = TrustStore::from_ders([root_der]).expect("store");
+    let report = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert!(report.signatures[0].valid);
+    assert_eq!(
+        report.signatures[0].chain_trusted,
+        Some(true),
+        "{}",
+        report.signatures[0].detail
+    );
+
+    // No store -> no chain check performed.
+    let none = verify_pdf_bytes(&signed).expect("verify");
+    assert_eq!(none.signatures[0].chain_trusted, None);
+
+    // A different (untrusted) root -> chain not trusted, even though the test
+    // roots share a subject name (the signature check is what rejects it).
+    let (_, other_root) = ca_signed_p12("pw");
+    let store2 = TrustStore::from_ders([other_root]).expect("store2");
+    let report2 = verify_pdf_bytes_with_roots(&signed, &store2).expect("verify");
+    assert_eq!(report2.signatures[0].chain_trusted, Some(false));
 }
 
 #[test]

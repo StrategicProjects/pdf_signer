@@ -126,8 +126,11 @@ assert!(report.all_valid());
 4. ~~Vendor + expose to R via extendr~~ ✅ done (in the `signer` R package).
 5. ~~PAdES-B-B / B-T / B-LT / B-LTA~~ ✅ done (DSS with certs + CRLs, document
    timestamp; the verifier reports doc timestamps).
-6. Remaining: OCSP (in addition to CRLs), full TSA-signature + chain validation
-   against the ICP-Brasil roots on verify, and HTTPS TSA/CRL support.
+6. ~~Certificate-chain validation against a trust store (ICP-Brasil roots)~~ ✅
+   done — `TrustStore::from_pem` + `verify_pdf_*_with_roots` report
+   `chain_trusted` per signature (RSA PKCS#1 v1.5 / SHA-256/384/512).
+7. Remaining: HTTPS TSA/CRL support, OCSP, ECDSA chains, full RFC 5280 path
+   processing (name constraints, policies) and revocation checking on verify.
 
 ## License
 
