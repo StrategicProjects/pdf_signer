@@ -15,6 +15,7 @@ use const_oid::db::rfc5912::{
     ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, SHA_256_WITH_RSA_ENCRYPTION,
     SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
 };
+use const_oid::db::rfc8410::ID_ED_25519;
 use der::{Decode, Encode};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::RsaPublicKey;
@@ -484,9 +485,24 @@ fn verify_cert_signature(child: &Certificate, issuer: &Certificate) -> bool {
         }
     } else if oid == ECDSA_WITH_SHA_256 || oid == ECDSA_WITH_SHA_384 || oid == ECDSA_WITH_SHA_512 {
         verify_ecdsa(&spki, &tbs, sig)
+    } else if oid == ID_ED_25519 {
+        verify_ed25519(&spki, &tbs, sig)
     } else {
-        false // unsupported (e.g. SHA-1, Ed25519)
+        false // unsupported (e.g. SHA-1)
     }
+}
+
+/// Verify an Ed25519 certificate signature.
+fn verify_ed25519(spki_der: &[u8], tbs: &[u8], sig: &[u8]) -> bool {
+    use signature::Verifier as _;
+    use spki::DecodePublicKey as _;
+    if let (Ok(vk), Ok(s)) = (
+        ed25519_dalek::VerifyingKey::from_public_key_der(spki_der),
+        ed25519::Signature::from_slice(sig),
+    ) {
+        return vk.verify(tbs, &s).is_ok();
+    }
+    false
 }
 
 /// Verify an ECDSA certificate signature over P-256 or P-384 (with the curve's

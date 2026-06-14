@@ -17,9 +17,10 @@ use const_oid::db::rfc5912::{
     ID_EC_PUBLIC_KEY, ID_SHA_256, ID_SHA_384, ID_SHA_512, RSA_ENCRYPTION, SECP_256_R_1,
     SECP_384_R_1,
 };
+use const_oid::db::rfc8410::ID_ED_25519;
 use const_oid::ObjectIdentifier;
 
-use der::asn1::{OctetString, SetOfVec, UtcTime};
+use der::asn1::{BitString, OctetString, SetOfVec, UtcTime};
 use der::{Any, DateTime, Decode, Encode, Sequence};
 
 use rsa::pkcs8::{DecodePrivateKey, PrivateKeyInfo};
@@ -83,6 +84,45 @@ fn sha384_alg() -> AlgorithmIdentifierOwned {
     AlgorithmIdentifierOwned {
         oid: ID_SHA_384,
         parameters: None,
+    }
+}
+
+fn sha512_alg() -> AlgorithmIdentifierOwned {
+    AlgorithmIdentifierOwned {
+        oid: ID_SHA_512,
+        parameters: None,
+    }
+}
+
+/// Adapter so the CMS / X.509 builders (which require
+/// `SignatureBitStringEncoding`) can drive an `ed25519-dalek` key.
+pub(crate) struct Ed25519Signer(pub(crate) ed25519_dalek::SigningKey);
+
+/// Newtype giving `ed25519::Signature` a `SignatureBitStringEncoding` impl.
+pub(crate) struct Ed25519Sig(ed25519::Signature);
+
+impl SignatureBitStringEncoding for Ed25519Sig {
+    fn to_bitstring(&self) -> der::Result<BitString> {
+        BitString::from_bytes(&self.0.to_bytes())
+    }
+}
+impl Keypair for Ed25519Signer {
+    type VerifyingKey = ed25519_dalek::VerifyingKey;
+    fn verifying_key(&self) -> Self::VerifyingKey {
+        self.0.verifying_key()
+    }
+}
+impl Signer<Ed25519Sig> for Ed25519Signer {
+    fn try_sign(&self, msg: &[u8]) -> std::result::Result<Ed25519Sig, signature::Error> {
+        Ok(Ed25519Sig(self.0.try_sign(msg)?))
+    }
+}
+impl DynSignatureAlgorithmIdentifier for Ed25519Signer {
+    fn signature_algorithm_identifier(&self) -> spki::Result<AlgorithmIdentifierOwned> {
+        Ok(AlgorithmIdentifierOwned {
+            oid: ID_ED_25519,
+            parameters: None,
+        })
     }
 }
 
@@ -178,6 +218,18 @@ pub(crate) fn cms_sign(
                 &sk, sha384_alg(), Sha384::digest(data).as_slice(), sid, &cert_der, &cert_ders,
             )?
         }
+        KeyKind::Ed25519 => {
+            let sk = ed25519_dalek::SigningKey::from_pkcs8_der(key_der).map_err(crypto)?;
+            // RFC 8419: Ed25519 in CMS uses SHA-512 for the message digest.
+            build_signed_data::<_, Ed25519Sig>(
+                &Ed25519Signer(sk),
+                sha512_alg(),
+                Sha512::digest(data).as_slice(),
+                sid,
+                &cert_der,
+                &cert_ders,
+            )?
+        }
     };
 
     match tsa_url {
@@ -191,6 +243,7 @@ enum KeyKind {
     Rsa,
     P256,
     P384,
+    Ed25519,
 }
 
 /// Determine the signing key type from its PKCS#8 algorithm identifier.
@@ -199,6 +252,8 @@ fn detect_key_kind(pkcs8_der: &[u8]) -> Result<KeyKind> {
     let oid = pki.algorithm.oid;
     if oid == RSA_ENCRYPTION {
         Ok(KeyKind::Rsa)
+    } else if oid == ID_ED_25519 {
+        Ok(KeyKind::Ed25519)
     } else if oid == ID_EC_PUBLIC_KEY {
         let curve = pki.algorithm.parameters_oid().map_err(crypto)?;
         if curve == SECP_256_R_1 {
@@ -392,6 +447,8 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
         }
     } else if spki.algorithm.oid == ID_EC_PUBLIC_KEY {
         verify_ecdsa_sig(&spki_der, &signed_attrs_der, sig_bytes)
+    } else if spki.algorithm.oid == ID_ED_25519 {
+        verify_ed25519_sig(&spki_der, &signed_attrs_der, sig_bytes)
     } else {
         return Err(Error::Verification("unsupported signer key algorithm".into()));
     };
@@ -430,6 +487,19 @@ fn verify_ecdsa_sig(spki_der: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     if let (Ok(vk), Ok(s)) = (
         p384::ecdsa::VerifyingKey::from_public_key_der(spki_der),
         p384::ecdsa::DerSignature::try_from(sig),
+    ) {
+        return vk.verify(msg, &s).is_ok();
+    }
+    false
+}
+
+/// Verify an Ed25519 signature over `msg`.
+fn verify_ed25519_sig(spki_der: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    use signature::Verifier as _;
+    use spki::DecodePublicKey as _;
+    if let (Ok(vk), Ok(s)) = (
+        ed25519_dalek::VerifyingKey::from_public_key_der(spki_der),
+        ed25519::Signature::from_slice(sig),
     ) {
         return vk.verify(msg, &s).is_ok();
     }

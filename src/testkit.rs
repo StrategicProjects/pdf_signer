@@ -120,6 +120,29 @@ pub fn self_signed_p384_p12(password: &str) -> Vec<u8> {
     ec_p12(password, &key_der, &cert.to_der().unwrap())
 }
 
+/// Build a self-signed **Ed25519** certificate and wrap it in a PKCS#12.
+pub fn self_signed_ed25519_p12(password: &str) -> Vec<u8> {
+    use rsa::pkcs8::EncodePrivateKey;
+    let mut rng = rand::thread_rng();
+    let sk = ed25519_dalek::SigningKey::generate(&mut rng);
+    let subject = Name::from_str("CN=pdf_signer Ed25519,O=StrategicProjects,C=BR").unwrap();
+    let spki = SubjectPublicKeyInfoOwned::from_key(sk.verifying_key()).unwrap();
+    let signer = crate::crypto::Ed25519Signer(sk.clone());
+    let cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap(),
+        subject,
+        spki,
+        &signer,
+    )
+    .unwrap()
+    .build::<crate::crypto::Ed25519Sig>()
+    .unwrap();
+    let key_der = sk.to_pkcs8_der().unwrap().as_bytes().to_vec();
+    ec_p12(password, &key_der, &cert.to_der().unwrap())
+}
+
 fn ec_p12(password: &str, key_der: &[u8], cert_der: &[u8]) -> Vec<u8> {
     let chain = PrivateKeyChain::new(
         key_der,
@@ -129,6 +152,50 @@ fn ec_p12(password: &str, key_der: &[u8], cert_der: &[u8]) -> Vec<u8> {
     let mut ks = KeyStore::new();
     ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
     ks.writer(password).write().unwrap()
+}
+
+/// A minimal one-page PDF that uses a **cross-reference stream** (PDF 1.5)
+/// instead of a traditional xref table, for testing the xref-stream path.
+pub fn sample_pdf_xref_stream() -> Vec<u8> {
+    let content: &[u8] = b"BT /F1 24 Tf 72 720 Td (xref-stream sample) Tj ET";
+    let mut out = Vec::new();
+    let mut off = [0usize; 7];
+    out.extend_from_slice(b"%PDF-1.5\n");
+    off[1] = out.len();
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    off[2] = out.len();
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    off[3] = out.len();
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+    );
+    off[4] = out.len();
+    out.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    out.extend_from_slice(content);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    off[5] = out.len();
+    out.extend_from_slice(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+    off[6] = out.len();
+
+    // Uncompressed cross-reference stream, W = [1, 4, 2], Index [0 7].
+    let mut data = vec![0u8, 0, 0, 0, 0, 0xFF, 0xFF]; // object 0: free
+    for &o in &off[1..=6] {
+        data.push(1);
+        data.extend_from_slice(&(o as u32).to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 4 2] /Index [0 7] /Length {} >>\nstream\n",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&data);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out.extend_from_slice(format!("startxref\n{}\n%%EOF\n", off[6]).as_bytes());
+    out
 }
 
 /// Build a self-signed RSA-2048 certificate and wrap it in a PKCS#12 keystore.

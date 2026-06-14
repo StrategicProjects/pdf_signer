@@ -52,8 +52,9 @@ $ pdfsig signed.pdf
   `basicConstraints` / `pathLenConstraint` / `keyCertSign`, **CRL + OCSP**
   revocation, **name constraints** (§4.2.1.10), and an optional **required
   policy** OID.
-- **RSA and ECDSA** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA P-256/SHA-256
-  and P-384/SHA-384), detected automatically from the keystore.
+- **RSA, ECDSA and Ed25519** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA
+  P-256/SHA-256 and P-384/SHA-384; Ed25519 per RFC 8419), detected automatically
+  from the keystore.
 - **Pure Rust**, with an optional `https` feature (rustls) for TLS endpoints.
 
 ### PAdES levels
@@ -122,10 +123,11 @@ pdf_signer = { version = "0.1", features = ["https"] }
   engine — `valid_policy_tree`, policy *mapping*,
   `requireExplicitPolicy`/`inhibitPolicyMapping` — is **not** implemented
   (doing it half-right is worse than not at all).
-- **Signing keys**: RSA (PKCS#1 v1.5 + SHA-256) and ECDSA (P-256/SHA-256,
-  P-384/SHA-384). Ed25519 and other curves are not handled.
-- Incremental updates use a **traditional xref table** (chained via `/Prev`),
-  accepted by PDF 1.5+ readers; no xref-*stream* output.
+- **Signing keys**: RSA (SHA-256), ECDSA (P-256/P-384) and Ed25519. Most PDF
+  readers (e.g. Adobe) do **not** validate Ed25519 PDF signatures yet — this
+  crate's own verifier does.
+- Incremental updates match the source: a **traditional xref table** *or* a
+  **cross-reference stream** (auto-detected), chained via `/Prev`.
 - Visible appearances use **standard Helvetica** (WinAnsi); no embedded
   fonts/images, approximate line wrapping.
 
@@ -139,9 +141,9 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] [extendr](https://extendr.github.io/) bindings + vendoring for R / CRAN
 - [x] ECDSA signing keys (P-256 / P-384)
 - [x] RFC 5280 name constraints + required-policy check
+- [x] Ed25519 signing keys; xref-stream incremental updates
 - [ ] Full policy processing (`valid_policy_tree`, policy mapping)
-- [ ] Ed25519 keys; xref-stream incremental updates
-- [ ] xref-stream incremental updates; richer appearances (fonts/images)
+- [ ] Richer visible appearances (embedded fonts / images)
 
 ## License
 
