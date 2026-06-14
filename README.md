@@ -9,6 +9,9 @@ This is a **proof of concept** built to replace the bundled
 Java runtime dependency and the binary blob, enabling a clean, CRAN-friendly
 native backend.
 
+The crypto stack is **100% pure Rust (RustCrypto)** — no OpenSSL, `ring`, or any
+system C library — so the crate can be fully vendored for a CRAN build.
+
 ## Status: the PoC works end to end
 
 A signed PDF produced here is validated **independently by Poppler's `pdfsig`**:
@@ -33,10 +36,13 @@ $ pdfsig signed.pdf                                     # third-party cross-chec
    and a zero-filled `/Contents` hex placeholder.
 2. **Byte surgery**: serialize once, locate the placeholder, compute the real
    `/ByteRange` and patch it length-preservingly.
-3. **CMS signature** (`openssl`): load the PKCS#12, produce a detached PKCS#7
-   (CMS) signature over the byte range, hex-encode it into `/Contents`.
-4. **Verify**: re-derive the signed byte range from the file, slice the CMS DER
-   out of the placeholder, and validate it cryptographically.
+3. **CMS signature** (`cms` + `rsa` + `sha2`, RustCrypto): load the PKCS#12
+   (`p12-keystore`), build a detached CMS SignedData with `messageDigest`,
+   `contentType` and `signingTime` signed attributes, RSA-sign it, and
+   hex-encode the DER into `/Contents`.
+4. **Verify**: re-derive the signed byte range, slice the CMS DER out of the
+   placeholder, check the `messageDigest` attribute against `SHA-256(data)` and
+   verify the signer's RSA signature over the signed attributes.
 
 ## API
 
@@ -58,22 +64,22 @@ assert!(report.all_valid());
   / rectangle / validation-link box from the R package is not rendered).
 - **Full-rewrite save**, not an incremental update. Fine for a first signature;
   must become an append-only incremental update before multi-signature support.
-- **OpenSSL backend.** Uses the system OpenSSL via the `openssl` crate. For a
-  vendored, CRAN-friendly build this should move to a pure-Rust RustCrypto
-  stack (`cms`, `pkcs12`) — the single biggest item before publishing.
-- **No PAdES-LTV / timestamps (RFC 3161)** and no chain/revocation checking on
-  verify (`NOVERIFY`); signer trust is reported but not enforced.
+- **RSA keys only.** The signer assumes RSA (PKCS#1 v1.5 + SHA-256). ECDSA /
+  Ed25519 keystores are not handled yet.
+- **No PAdES-LTV / timestamps (RFC 3161)** and no certificate chain / revocation
+  checking on verify; the signer DN is reported but trust is not enforced.
 - Single signature parsed on verify; AcroForm is overwritten rather than merged.
 
 ## Roadmap to replace the JAR in `signer`
 
-1. Visual appearance stream (port the `signtext` box + validation link).
-2. Incremental-update save for multi-signature / re-signing.
-3. Swap OpenSSL → RustCrypto, then vendor crates for an R package build
-   (`SystemRequirements: Cargo, rustc`).
-4. Expose to R: either a thin CLI invoked via `system2`, or a native binding
+1. ~~Swap OpenSSL → RustCrypto~~ ✅ done — pure-Rust `cms`/`rsa`/`p12-keystore`.
+2. Visual appearance stream (port the `signtext` box + validation link).
+3. Incremental-update save for multi-signature / re-signing.
+4. Vendor crates for an R package build (`SystemRequirements: Cargo, rustc`).
+5. Expose to R: either a thin CLI invoked via `system2`, or a native binding
    (e.g. via `extendr`) compiled into the package.
-5. PAdES baseline (B-T) with RFC 3161 timestamps if legal validity requires it.
+6. PAdES baseline (B-T) with RFC 3161 timestamps if legal validity requires it,
+   plus certificate-chain validation against the ICP-Brasil roots on verify.
 
 ## License
 

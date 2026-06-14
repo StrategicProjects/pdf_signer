@@ -59,6 +59,7 @@ fn cmd_verify(args: &[String]) -> ExitCode {
             for (i, s) in report.signatures.iter().enumerate() {
                 println!("signature #{}:", i + 1);
                 println!("  valid:                 {}", s.valid);
+                println!("  signer:                {}", s.signer.as_deref().unwrap_or("-"));
                 println!("  byte_range:            {:?}", s.byte_range);
                 println!("  signed_len:            {} bytes", s.signed_len);
                 println!("  covers_whole_document: {}", s.covers_whole_document);

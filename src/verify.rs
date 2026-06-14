@@ -2,11 +2,7 @@
 
 use std::path::Path;
 
-use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
-use openssl::stack::Stack;
-use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::X509;
-
+use crate::crypto::cms_verify;
 use crate::error::Error;
 use crate::util::{der_total_len, find_sub, hex_decode};
 use crate::Result;
@@ -22,6 +18,8 @@ pub struct VerifiedSignature {
     pub signed_len: usize,
     /// Whether the byte range covers the whole file except the signature hole.
     pub covers_whole_document: bool,
+    /// Signer certificate subject DN, when the signature could be parsed.
+    pub signer: Option<String>,
     /// Human-readable detail (error message when invalid).
     pub detail: String,
 }
@@ -65,9 +63,13 @@ pub fn verify_pdf_bytes(pdf: &[u8]) -> Result<SignatureReport> {
 
     let covers_whole_document = s1 == 0 && (s2 + l2) == pdf.len();
 
-    let (valid, detail) = match cms_verify(&der, &signed) {
-        Ok(()) => (true, "CMS signature valid over the signed byte range".to_string()),
-        Err(e) => (false, format!("{e}")),
+    let (valid, signer, detail) = match cms_verify(&der, &signed) {
+        Ok(v) => (
+            true,
+            Some(v.signer_subject.clone()),
+            format!("valid CMS signature; signer: {}", v.signer_subject),
+        ),
+        Err(e) => (false, None, format!("{e}")),
     };
 
     Ok(SignatureReport {
@@ -76,6 +78,7 @@ pub fn verify_pdf_bytes(pdf: &[u8]) -> Result<SignatureReport> {
             byte_range,
             signed_len: l1 + l2,
             covers_whole_document,
+            signer,
             detail,
         }],
     })
@@ -123,17 +126,4 @@ fn extract_cms(pdf: &[u8], byte_range_pos: usize) -> Result<Vec<u8>> {
         return Err(Error::Malformed("CMS DER length exceeds placeholder".into()));
     }
     Ok(raw[..len].to_vec())
-}
-
-/// Verify a detached CMS over `data`. Uses NOVERIFY so self-signed PoC certs
-/// validate cryptographically without a trust chain.
-fn cms_verify(der: &[u8], data: &[u8]) -> Result<()> {
-    let pkcs7 = Pkcs7::from_der(der)?;
-    let certs = Stack::<X509>::new()?;
-    let store = X509StoreBuilder::new()?.build();
-    let flags = Pkcs7Flags::NOVERIFY | Pkcs7Flags::BINARY;
-    let mut out = Vec::new();
-    pkcs7
-        .verify(&certs, &store, Some(data), Some(&mut out), flags)
-        .map_err(Error::from)
 }

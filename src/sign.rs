@@ -3,11 +3,8 @@
 use std::path::Path;
 
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
-use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
-use openssl::pkcs12::Pkcs12;
-use openssl::stack::Stack;
-use openssl::x509::X509;
 
+use crate::crypto::cms_sign;
 use crate::error::Error;
 use crate::util::{find_sub, hex_encode};
 use crate::Result;
@@ -259,28 +256,4 @@ fn patch_byte_range(buf: &mut [u8], a: i64, b: i64, c: i64) -> Result<()> {
     }
     buf[open..=close].copy_from_slice(&replacement);
     Ok(())
-}
-
-/// Produce a detached CMS (PKCS#7) signature over `data` using the keystore.
-fn cms_sign(keystore_p12: &[u8], password: &str, data: &[u8]) -> Result<Vec<u8>> {
-    let pkcs12 = Pkcs12::from_der(keystore_p12)?;
-    let parsed = pkcs12.parse2(password)?;
-    let cert = parsed
-        .cert
-        .ok_or_else(|| Error::Malformed("keystore has no certificate".into()))?;
-    let pkey = parsed
-        .pkey
-        .ok_or_else(|| Error::Malformed("keystore has no private key".into()))?;
-
-    let mut chain = Stack::<X509>::new()?;
-    if let Some(ca) = parsed.ca {
-        for c in ca {
-            chain.push(c)?;
-        }
-    }
-
-    // DETACHED: data is not embedded. BINARY: no CRLF canonicalization.
-    let flags = Pkcs7Flags::DETACHED | Pkcs7Flags::BINARY;
-    let pkcs7 = Pkcs7::sign(&cert, &pkey, &chain, data, flags)?;
-    Ok(pkcs7.to_der()?)
 }

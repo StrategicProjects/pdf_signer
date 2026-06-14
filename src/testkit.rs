@@ -1,18 +1,27 @@
 //! Test/demo helpers: build a minimal sample PDF and a self-signed PKCS#12.
 //!
-//! These exist so the PoC is fully reproducible without external fixtures.
-//! They are not part of the production signing/verification surface.
+//! These exist so the PoC is fully reproducible without external fixtures and
+//! without OpenSSL — everything is pure RustCrypto. They are not part of the
+//! production signing/verification surface.
+
+use std::str::FromStr;
+use std::time::Duration;
 
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 
-use openssl::asn1::Asn1Time;
-use openssl::bn::{BigNum, MsbOption};
-use openssl::hash::MessageDigest;
-use openssl::pkcs12::Pkcs12;
-use openssl::pkey::PKey;
-use openssl::rsa::Rsa;
-use openssl::x509::{X509NameBuilder, X509};
+use der::Encode;
+use p12_keystore::{Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
+use rsa::pkcs1v15::{Signature, SigningKey};
+use rsa::pkcs8::EncodePrivateKey;
+use rsa::RsaPrivateKey;
+use sha2::Sha256;
+use signature::Keypair;
+use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::name::Name;
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::SubjectPublicKeyInfoOwned;
+use x509_cert::time::Validity;
 
 /// Build a minimal, valid one-page PDF with a line of text.
 pub fn sample_pdf() -> Vec<u8> {
@@ -70,36 +79,37 @@ pub fn sample_pdf() -> Vec<u8> {
 
 /// Build a self-signed RSA-2048 certificate and wrap it in a PKCS#12 keystore.
 pub fn self_signed_p12(password: &str) -> Vec<u8> {
-    let rsa = Rsa::generate(2048).unwrap();
-    let pkey = PKey::from_rsa(rsa).unwrap();
+    let mut rng = rand::thread_rng();
+    let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+    let signing_key = SigningKey::<Sha256>::new(priv_key.clone());
 
-    let mut nb = X509NameBuilder::new().unwrap();
-    nb.append_entry_by_text("C", "BR").unwrap();
-    nb.append_entry_by_text("O", "StrategicProjects").unwrap();
-    nb.append_entry_by_text("CN", "pdf_signer PoC").unwrap();
-    let name = nb.build();
+    let subject =
+        Name::from_str("CN=pdf_signer PoC,O=StrategicProjects,C=BR").expect("subject name");
+    let spki =
+        SubjectPublicKeyInfoOwned::from_key(signing_key.verifying_key()).expect("spki from key");
 
-    let mut b = X509::builder().unwrap();
-    b.set_version(2).unwrap();
-    let serial = {
-        let mut bn = BigNum::new().unwrap();
-        bn.rand(159, MsbOption::MAYBE_ZERO, false).unwrap();
-        bn.to_asn1_integer().unwrap()
-    };
-    b.set_serial_number(&serial).unwrap();
-    b.set_subject_name(&name).unwrap();
-    b.set_issuer_name(&name).unwrap();
-    b.set_pubkey(&pkey).unwrap();
-    b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
-    b.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
-    b.sign(&pkey, MessageDigest::sha256()).unwrap();
-    let cert = b.build();
+    let builder = CertificateBuilder::new(
+        Profile::Root, // self-signed root: issuer == subject
+        SerialNumber::from(1u32),
+        Validity::from_now(Duration::from_secs(365 * 24 * 3600)).expect("validity"),
+        subject,
+        spki,
+        &signing_key,
+    )
+    .expect("certificate builder");
+    let cert = builder.build::<Signature>().expect("build cert");
+    let cert_der = cert.to_der().expect("cert der");
 
-    let p12 = Pkcs12::builder()
-        .name("poc")
-        .pkey(&pkey)
-        .cert(&cert)
-        .build2(password)
-        .unwrap();
-    p12.to_der().unwrap()
+    let key_der = priv_key
+        .to_pkcs8_der()
+        .expect("pkcs8 der")
+        .as_bytes()
+        .to_vec();
+
+    let p12_cert = P12Certificate::from_der(&cert_der).expect("p12 cert");
+    let chain = PrivateKeyChain::new(&key_der, b"poc", vec![p12_cert]);
+
+    let mut ks = KeyStore::new();
+    ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
+    ks.writer(password).write().expect("write p12")
 }

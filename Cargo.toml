@@ -18,5 +18,17 @@ path = "src/main.rs"
 
 [dependencies]
 lopdf = "0.36"
-openssl = "0.10"
 thiserror = "2"
+
+# Pure-Rust crypto stack (no OpenSSL / system libs) for a vendorable CRAN build.
+# x509-cert is pulled in transitively by cms; we use its `builder` for testkit.
+cms = { version = "0.2", features = ["builder"] }
+x509-cert = { version = "0.2", features = ["builder"] }
+der = { version = "0.7", features = ["oid"] }
+spki = "0.7"
+const-oid = { version = "0.9", features = ["db"] }
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+signature = "2"
+p12-keystore = "0.2"
+rand = "0.8"

@@ -9,8 +9,8 @@ pub enum Error {
     #[error("PDF parsing/serialization error: {0}")]
     Pdf(#[from] lopdf::Error),
 
-    #[error("OpenSSL error: {0}")]
-    OpenSsl(#[from] openssl::error::ErrorStack),
+    #[error("cryptography error: {0}")]
+    Crypto(String),
 
     /// The placeholder reserved for the signature is too small for the
     /// produced CMS blob. Increase `SignOptions::signature_capacity`.
