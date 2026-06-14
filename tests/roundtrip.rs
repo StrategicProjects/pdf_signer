@@ -152,6 +152,24 @@ fn pades_bt_embeds_timestamp() {
 }
 
 #[test]
+#[ignore = "requires network + the `https` feature: cargo test --features https -- --ignored"]
+fn pades_bt_over_https_tsa() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        pades_level: PadesLevel::Bt,
+        tsa_url: Some("https://freetsa.org/tsr".into()),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("B-T over HTTPS TSA");
+    assert!(
+        contains(&signed, b"060b2a864886f70d010910020e"),
+        "timestamp token embedded"
+    );
+    assert!(verify_pdf_bytes(&signed).expect("verify").all_valid());
+}
+
+#[test]
 #[ignore = "requires network access (TSA + CRL fetch)"]
 fn pades_blta_builds_dss_and_document_timestamp() {
     let pdf = sample_pdf();

@@ -16,7 +16,8 @@ Signatures are **PAdES** up to **B-LTA** via `SignOptions::pades_level`:
 **B-B** (CAdES `signing-certificate-v2`), **B-T** (RFC 3161 signature
 timestamp), **B-LT** (a `/DSS` with the certificate chain + fetched CRLs), and
 **B-LTA** (a `/DocTimeStamp` over the whole file). The timestamp / CRL fetching
-uses a tiny dependency-free HTTP client (`http://` endpoints only).
+uses a tiny dependency-free HTTP client (`http://` only); enable the **`https`**
+Cargo feature for TLS endpoints (e.g. ICP-Brasil TSAs) — it adds `ureq`/rustls.
 
 ## Status: the PoC works end to end
 
@@ -129,8 +130,9 @@ assert!(report.all_valid());
 6. ~~Certificate-chain validation against a trust store (ICP-Brasil roots)~~ ✅
    done — `TrustStore::from_pem` + `verify_pdf_*_with_roots` report
    `chain_trusted` per signature (RSA PKCS#1 v1.5 / SHA-256/384/512).
-7. Remaining: HTTPS TSA/CRL support, OCSP, ECDSA chains, full RFC 5280 path
-   processing (name constraints, policies) and revocation checking on verify.
+7. ~~HTTPS TSA/CRL support~~ ✅ done (optional `https` feature, rustls).
+8. Remaining: OCSP, ECDSA chains, full RFC 5280 path processing (name
+   constraints, policies) and revocation checking on verify.
 
 ## License
 

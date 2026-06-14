@@ -32,3 +32,11 @@ sha2 = "0.10"
 signature = "2"
 p12-keystore = "0.2"
 rand = "0.8"
+
+# Optional: HTTPS for TSA / CRL endpoints (rustls). Off by default to keep the
+# base crate pure-Rust and lean; enable for ICP-Brasil HTTPS TSAs.
+ureq = { version = "3", optional = true }
+
+[features]
+default = []
+https = ["dep:ureq"]
