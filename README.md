@@ -12,6 +12,10 @@ native backend.
 The crypto stack is **100% pure Rust (RustCrypto)** — no OpenSSL, `ring`, or any
 system C library — so the crate can be fully vendored for a CRAN build.
 
+Signatures are **PAdES-B-B** (CAdES `ETSI.CAdES.detached` with a
+`signing-certificate-v2` attribute). Passing a `tsa_url` adds an **RFC 3161
+signature timestamp** (PAdES-B-T) via a tiny dependency-free HTTP client.
+
 ## Status: the PoC works end to end
 
 A signed PDF produced here is validated **independently by Poppler's `pdfsig`**:
@@ -117,11 +121,11 @@ assert!(report.all_valid());
 1. ~~Swap OpenSSL → RustCrypto~~ ✅ done — pure-Rust `cms`/`rsa`/`p12-keystore`.
 2. ~~Visual appearance stream (`signtext` box + validation link)~~ ✅ done.
 3. ~~Incremental-update save for multi-signature / re-signing~~ ✅ done.
-4. Vendor crates for an R package build (`SystemRequirements: Cargo, rustc`).
-5. Expose to R: either a thin CLI invoked via `system2`, or a native binding
-   (e.g. via `extendr`) compiled into the package.
-6. PAdES baseline (B-T) with RFC 3161 timestamps if legal validity requires it,
-   plus certificate-chain validation against the ICP-Brasil roots on verify.
+4. ~~Vendor + expose to R via extendr~~ ✅ done (in the `signer` R package).
+5. ~~PAdES-B-B (signing-certificate-v2) + B-T (RFC 3161 timestamp)~~ ✅ done.
+6. PAdES-B-LT / B-LTA: embed validation material (DSS: certs, CRL/OCSP) and a
+   document timestamp; certificate-chain validation against the ICP-Brasil
+   roots on verify; HTTPS TSA support.
 
 ## License
 

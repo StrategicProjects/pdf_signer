@@ -20,9 +20,8 @@ fn sign_then_verify_roundtrip() {
 
     assert!(signed.len() > pdf.len(), "signed PDF should grow");
     assert!(
-        signed.windows(b"adbe.pkcs7.detached".len())
-            .any(|w| w == b"adbe.pkcs7.detached"),
-        "signed PDF must contain the signature SubFilter"
+        contains(&signed, b"ETSI.CAdES.detached"),
+        "signed PDF must carry the PAdES SubFilter"
     );
 
     let report = verify_pdf_bytes(&signed).expect("verify failed");
@@ -113,6 +112,40 @@ fn second_signature_keeps_the_first_valid() {
     // The earlier signature covers the doc as it was; the later one covers all.
     assert!(!report.signatures[0].covers_whole_document);
     assert!(report.signatures[1].covers_whole_document);
+}
+
+#[test]
+fn pades_bb_carries_signing_certificate() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    assert!(contains(&signed, b"ETSI.CAdES.detached"), "PAdES SubFilter");
+    // id-aa-signingCertificateV2 OID, hex-encoded inside /Contents.
+    assert!(
+        contains(&signed, b"060b2a864886f70d010910022f"),
+        "CMS must carry signing-certificate-v2 (PAdES-B-B)"
+    );
+    assert!(verify_pdf_bytes(&signed).expect("verify").all_valid());
+}
+
+#[test]
+#[ignore = "requires network access to a public RFC 3161 TSA"]
+fn pades_bt_embeds_timestamp() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        tsa_url: Some("http://timestamp.digicert.com".into()),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("sign + timestamp");
+
+    // id-aa-timeStampToken OID, hex-encoded inside /Contents.
+    assert!(
+        contains(&signed, b"060b2a864886f70d010910020e"),
+        "CMS must carry an RFC 3161 timestamp token (PAdES-B-T)"
+    );
+    assert!(verify_pdf_bytes(&signed).expect("verify").all_valid());
 }
 
 #[test]

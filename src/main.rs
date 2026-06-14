@@ -25,7 +25,7 @@ fn main() -> ExitCode {
 
 fn cmd_sign(args: &[String]) -> ExitCode {
     if args.len() < 6 {
-        eprintln!("sign: need <input.pdf> <output.pdf> <keystore.p12> <password> [reason]");
+        eprintln!("sign: need <input.pdf> <output.pdf> <keystore.p12> <password> [reason] [tsa_url]");
         return ExitCode::from(2);
     }
     let reason = args.get(6).cloned();
@@ -36,6 +36,7 @@ fn cmd_sign(args: &[String]) -> ExitCode {
     let opts = SignOptions {
         reason,
         name: Some("pdf_signer PoC".to_string()),
+        tsa_url: args.get(7).cloned(), // optional RFC 3161 TSA http:// URL
         appearance: Some(Appearance {
             page: 1,
             x: 36.0,
