@@ -1,5 +1,5 @@
 use pdf_signer::testkit::{sample_pdf, self_signed_p12};
-use pdf_signer::{sign_pdf_bytes, verify_pdf_bytes, Appearance, SignOptions};
+use pdf_signer::{sign_pdf_bytes, verify_pdf_bytes, Appearance, PadesLevel, SignOptions};
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
@@ -146,6 +146,29 @@ fn pades_bt_embeds_timestamp() {
         "CMS must carry an RFC 3161 timestamp token (PAdES-B-T)"
     );
     assert!(verify_pdf_bytes(&signed).expect("verify").all_valid());
+}
+
+#[test]
+#[ignore = "requires network access (TSA + CRL fetch)"]
+fn pades_blta_builds_dss_and_document_timestamp() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        pades_level: PadesLevel::Blta,
+        tsa_url: Some("http://timestamp.digicert.com".into()),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("B-LTA sign");
+
+    assert!(contains(&signed, b"/DSS"), "Document Security Store");
+    assert!(contains(&signed, b"/Certs"), "DSS certificates");
+    assert!(contains(&signed, b"DocTimeStamp"), "document timestamp");
+    assert!(contains(&signed, b"ETSI.RFC3161"), "doc-timestamp SubFilter");
+
+    let report = verify_pdf_bytes(&signed).expect("verify");
+    assert_eq!(report.signatures.len(), 2, "signature + document timestamp");
+    assert!(report.all_valid(), "both must validate");
+    assert!(report.signatures[1].detail.contains("timestamp"));
 }
 
 #[test]

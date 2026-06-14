@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use pdf_signer::{sign_pdf_file, verify_pdf_file, Appearance, SignOptions};
+use pdf_signer::{sign_pdf_file, verify_pdf_file, Appearance, PadesLevel, SignOptions};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -25,7 +25,7 @@ fn main() -> ExitCode {
 
 fn cmd_sign(args: &[String]) -> ExitCode {
     if args.len() < 6 {
-        eprintln!("sign: need <input.pdf> <output.pdf> <keystore.p12> <password> [reason] [tsa_url]");
+        eprintln!("sign: need <input.pdf> <output.pdf> <keystore.p12> <password> [reason] [tsa_url] [bb|bt|blt|blta]");
         return ExitCode::from(2);
     }
     let reason = args.get(6).cloned();
@@ -33,10 +33,17 @@ fn cmd_sign(args: &[String]) -> ExitCode {
         "{}\nAssinado digitalmente por pdf_signer PoC (StrategicProjects).\nValidar em: apps.example.org/validate",
         reason.as_deref().unwrap_or("Documento assinado digitalmente")
     );
+    let level = match args.get(8).map(String::as_str) {
+        Some("bt") => PadesLevel::Bt,
+        Some("blt") => PadesLevel::Blt,
+        Some("blta") => PadesLevel::Blta,
+        _ => PadesLevel::Bb,
+    };
     let opts = SignOptions {
         reason,
         name: Some("pdf_signer PoC".to_string()),
         tsa_url: args.get(7).cloned(), // optional RFC 3161 TSA http:// URL
+        pades_level: level,
         appearance: Some(Appearance {
             page: 1,
             x: 36.0,

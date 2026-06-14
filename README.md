@@ -12,9 +12,11 @@ native backend.
 The crypto stack is **100% pure Rust (RustCrypto)** — no OpenSSL, `ring`, or any
 system C library — so the crate can be fully vendored for a CRAN build.
 
-Signatures are **PAdES-B-B** (CAdES `ETSI.CAdES.detached` with a
-`signing-certificate-v2` attribute). Passing a `tsa_url` adds an **RFC 3161
-signature timestamp** (PAdES-B-T) via a tiny dependency-free HTTP client.
+Signatures are **PAdES** up to **B-LTA** via `SignOptions::pades_level`:
+**B-B** (CAdES `signing-certificate-v2`), **B-T** (RFC 3161 signature
+timestamp), **B-LT** (a `/DSS` with the certificate chain + fetched CRLs), and
+**B-LTA** (a `/DocTimeStamp` over the whole file). The timestamp / CRL fetching
+uses a tiny dependency-free HTTP client (`http://` endpoints only).
 
 ## Status: the PoC works end to end
 
@@ -122,10 +124,10 @@ assert!(report.all_valid());
 2. ~~Visual appearance stream (`signtext` box + validation link)~~ ✅ done.
 3. ~~Incremental-update save for multi-signature / re-signing~~ ✅ done.
 4. ~~Vendor + expose to R via extendr~~ ✅ done (in the `signer` R package).
-5. ~~PAdES-B-B (signing-certificate-v2) + B-T (RFC 3161 timestamp)~~ ✅ done.
-6. PAdES-B-LT / B-LTA: embed validation material (DSS: certs, CRL/OCSP) and a
-   document timestamp; certificate-chain validation against the ICP-Brasil
-   roots on verify; HTTPS TSA support.
+5. ~~PAdES-B-B / B-T / B-LT / B-LTA~~ ✅ done (DSS with certs + CRLs, document
+   timestamp; the verifier reports doc timestamps).
+6. Remaining: OCSP (in addition to CRLs), full TSA-signature + chain validation
+   against the ICP-Brasil roots on verify, and HTTPS TSA/CRL support.
 
 ## License
 
