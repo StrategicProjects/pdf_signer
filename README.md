@@ -27,7 +27,28 @@ $ pdfsig signed.pdf                                     # third-party cross-chec
   - Signature Validation: Signature is Valid.
 ```
 
-`cargo test` covers the round trip, tamper detection, and the unsigned case.
+Signatures can be **invisible** or carry a **visible appearance** — a bordered
+box with wrapped text (the `signtext` + validation link), placed at any
+position on any page:
+
+```rust
+use pdf_signer::{sign_pdf_file, Appearance, SignOptions};
+
+sign_pdf_file("in.pdf", "out.pdf", "keystore.p12", "password", &SignOptions {
+    reason: Some("Aprovado".into()),
+    appearance: Some(Appearance {
+        page: 1,
+        x: 36.0, y: 36.0, width: 320.0, height: 64.0,
+        font_size: 8.0,
+        text: "Assinado por Fulano.\nValidar em: exemplo.org/validar".into(),
+        border: true,
+    }),
+    ..Default::default()
+})?;
+```
+
+`cargo test` covers the round trip, tamper detection, the visible appearance,
+and the unsigned case.
 
 ## How it works
 
@@ -62,6 +83,9 @@ assert!(report.all_valid());
 
 - **Invisible signature only** — no visual appearance stream yet (the `signtext`
   / rectangle / validation-link box from the R package is not rendered).
+- **Basic appearance.** Visible signatures use the standard Helvetica font with
+  approximate (character-count) line wrapping and WinAnsi encoding, so glyphs
+  outside Latin-1 become `?`. No logo/image support yet.
 - **Full-rewrite save**, not an incremental update. Fine for a first signature;
   must become an append-only incremental update before multi-signature support.
 - **RSA keys only.** The signer assumes RSA (PKCS#1 v1.5 + SHA-256). ECDSA /
@@ -73,7 +97,7 @@ assert!(report.all_valid());
 ## Roadmap to replace the JAR in `signer`
 
 1. ~~Swap OpenSSL → RustCrypto~~ ✅ done — pure-Rust `cms`/`rsa`/`p12-keystore`.
-2. Visual appearance stream (port the `signtext` box + validation link).
+2. ~~Visual appearance stream (`signtext` box + validation link)~~ ✅ done.
 3. Incremental-update save for multi-signature / re-signing.
 4. Vendor crates for an R package build (`SystemRequirements: Cargo, rustc`).
 5. Expose to R: either a thin CLI invoked via `system2`, or a native binding

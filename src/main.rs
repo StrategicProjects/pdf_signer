@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use pdf_signer::{sign_pdf_file, verify_pdf_file, SignOptions};
+use pdf_signer::{sign_pdf_file, verify_pdf_file, Appearance, SignOptions};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -28,9 +28,24 @@ fn cmd_sign(args: &[String]) -> ExitCode {
         eprintln!("sign: need <input.pdf> <output.pdf> <keystore.p12> <password> [reason]");
         return ExitCode::from(2);
     }
+    let reason = args.get(6).cloned();
+    let box_text = format!(
+        "{}\nAssinado digitalmente por pdf_signer PoC (StrategicProjects).\nValidar em: apps.example.org/validate",
+        reason.as_deref().unwrap_or("Documento assinado digitalmente")
+    );
     let opts = SignOptions {
-        reason: args.get(6).cloned(),
+        reason,
         name: Some("pdf_signer PoC".to_string()),
+        appearance: Some(Appearance {
+            page: 1,
+            x: 36.0,
+            y: 36.0,
+            width: 320.0,
+            height: 64.0,
+            font_size: 8.0,
+            text: box_text,
+            border: true,
+        }),
         ..Default::default()
     };
     match sign_pdf_file(&args[2], &args[3], &args[4], &args[5], &opts) {

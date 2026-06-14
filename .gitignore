@@ -7,3 +7,6 @@ Cargo.lock.bak
 /keystore.p12
 *.pdf
 *.p12
+
+# macOS
+.DS_Store

@@ -1,5 +1,9 @@
 use pdf_signer::testkit::{sample_pdf, self_signed_p12};
-use pdf_signer::{sign_pdf_bytes, verify_pdf_bytes, SignOptions};
+use pdf_signer::{sign_pdf_bytes, verify_pdf_bytes, Appearance, SignOptions};
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
 
 #[test]
 fn sign_then_verify_roundtrip() {
@@ -44,6 +48,31 @@ fn tampered_document_is_rejected() {
         !report.signatures[0].valid,
         "a modified document must fail verification"
     );
+}
+
+#[test]
+fn visible_appearance_round_trip() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        reason: Some("Aprovado".into()),
+        appearance: Some(Appearance {
+            text: "Assinado digitalmente por Fulano.\nValidar em: exemplo.org/validar".into(),
+            ..Appearance::default()
+        }),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("signing failed");
+
+    // The widget now carries an appearance stream and a Form XObject.
+    assert!(contains(&signed, b"/AP"), "widget should have an /AP entry");
+    assert!(contains(&signed, b"/Subtype /Form") || contains(&signed, b"/Subtype/Form"));
+    assert!(contains(&signed, b"/Helv"), "appearance font should be present");
+
+    // And the signature must still verify after adding the appearance.
+    let report = verify_pdf_bytes(&signed).expect("verify failed");
+    assert!(report.signatures[0].valid, "{}", report.signatures[0].detail);
+    assert!(report.signatures[0].covers_whole_document);
 }
 
 #[test]
