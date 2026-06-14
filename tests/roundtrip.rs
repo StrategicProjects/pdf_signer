@@ -1,4 +1,4 @@
-use pdf_signer::testkit::{ca_signed_p12, sample_pdf, self_signed_p12};
+use pdf_signer::testkit::{ca_chain3_p12, ca_signed_p12, sample_pdf, self_signed_p12};
 use pdf_signer::{
     sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
     SignOptions, TrustStore,
@@ -219,6 +219,25 @@ fn chain_validates_against_trusted_root() {
     let store2 = TrustStore::from_ders([other_root]).expect("store2");
     let report2 = verify_pdf_bytes_with_roots(&signed, &store2).expect("verify");
     assert_eq!(report2.signatures[0].chain_trusted, Some(false));
+}
+
+#[test]
+fn chain_validates_through_intermediate_ca() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_chain3_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // The CMS now embeds the full chain, so the path leaf -> intermediate ->
+    // root can be built; the intermediate must pass the CA / keyCertSign checks.
+    let store = TrustStore::from_ders([root_der]).expect("store");
+    let report = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert!(report.signatures[0].valid);
+    assert_eq!(
+        report.signatures[0].chain_trusted,
+        Some(true),
+        "{}",
+        report.signatures[0].detail
+    );
 }
 
 #[test]

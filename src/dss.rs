@@ -175,6 +175,45 @@ fn der_stream(der: &[u8]) -> Object {
     Object::Stream(Stream::new(Dictionary::new(), der.to_vec()))
 }
 
+/// Extract the DER of every CRL stored in the document's `/DSS /CRLs`, for use
+/// in revocation checking. Returns an empty vec if there is no DSS.
+pub(crate) fn extract_dss_crls(pdf: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let Ok(doc) = Document::load_mem(pdf) else {
+        return out;
+    };
+    let Ok(root_id) = doc.trailer.get(b"Root").and_then(|o| o.as_reference()) else {
+        return out;
+    };
+    let Ok(catalog) = doc.get_object(root_id).and_then(|o| o.as_dict()) else {
+        return out;
+    };
+    // /DSS may be an inline dict or a reference.
+    let dss = match catalog.get(b"DSS") {
+        Ok(Object::Dictionary(d)) => d.clone(),
+        Ok(Object::Reference(r)) => match doc.get_object(*r).and_then(|o| o.as_dict()) {
+            Ok(d) => d.clone(),
+            Err(_) => return out,
+        },
+        _ => return out,
+    };
+    let Ok(crls) = dss.get(b"CRLs").and_then(|o| o.as_array()) else {
+        return out;
+    };
+    for item in crls {
+        if let Ok(id) = item.as_reference() {
+            if let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) {
+                out.push(
+                    stream
+                        .decompressed_content()
+                        .unwrap_or_else(|_| stream.content.clone()),
+                );
+            }
+        }
+    }
+    out
+}
+
 fn map<E: std::fmt::Display>(e: E) -> Error {
     Error::Crypto(e.to_string())
 }

@@ -4,11 +4,21 @@ use std::path::Path;
 
 use std::time::SystemTime;
 
+use der::Decode;
+use x509_cert::crl::CertificateList;
+
 use crate::crypto::{cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
 use crate::error::Error;
 use crate::trust::{verify_chain, TrustStore};
 use crate::util::{der_total_len, find_sub, hex_decode};
 use crate::Result;
+
+/// Parse CRL DER blobs, silently dropping any that fail to decode.
+fn parse_crls(ders: &[Vec<u8>]) -> Vec<CertificateList> {
+    ders.iter()
+        .filter_map(|d| CertificateList::from_der(d).ok())
+        .collect()
+}
 
 /// Outcome of verifying a single signature.
 #[derive(Debug, Clone)]
@@ -120,7 +130,8 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
     // Chain validation against the trust store (regular signatures only).
     if !is_timestamp && !roots.is_empty() {
         if let Ok((leaf, pool)) = signer_certificate_and_pool(&der) {
-            let result = verify_chain(&leaf, &pool, roots, SystemTime::now());
+            let crls = parse_crls(&crate::dss::extract_dss_crls(pdf));
+            let result = verify_chain(&leaf, &pool, roots, &crls, SystemTime::now());
             chain_trusted = Some(result.trusted);
             detail = format!("{detail}; chain: {}", result.detail);
         } else {

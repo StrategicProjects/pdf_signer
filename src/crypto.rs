@@ -161,12 +161,17 @@ pub(crate) fn cms_sign(
         .add_signed_attribute(signing_certificate_v2_attribute(&cert_der)?)
         .map_err(crypto)?;
 
-    // 3. Assemble the SignedData and DER-encode the ContentInfo wrapper.
-    let content_info = SignedDataBuilder::new(&encap)
-        .add_digest_algorithm(sha256_alg())
-        .map_err(crypto)?
-        .add_certificate(CertificateChoices::Certificate(cert))
-        .map_err(crypto)?
+    // 3. Assemble the SignedData, embedding the whole certificate chain (so
+    //    intermediates are available for path building and the DSS).
+    let mut builder = SignedDataBuilder::new(&encap);
+    builder.add_digest_algorithm(sha256_alg()).map_err(crypto)?;
+    for entry in chain.chain() {
+        let c = Certificate::from_der(entry.as_der()).map_err(crypto)?;
+        builder
+            .add_certificate(CertificateChoices::Certificate(c))
+            .map_err(crypto)?;
+    }
+    let content_info = builder
         .add_signer_info::<SigningKey<Sha256>, Signature>(signer_info)
         .map_err(crypto)?
         .build()

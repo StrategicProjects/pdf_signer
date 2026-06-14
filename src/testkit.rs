@@ -174,3 +174,80 @@ pub fn ca_signed_p12(password: &str) -> (Vec<u8>, Vec<u8>) {
     ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
     (ks.writer(password).write().expect("write p12"), root_der)
 }
+
+/// Build a three-level PKI (root CA → intermediate CA → leaf). Returns
+/// `(p12, root_cert_der)`; the p12 holds the leaf key + `[leaf, intermediate,
+/// root]` chain, exercising path building through an intermediate.
+pub fn ca_chain3_p12(password: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).expect("validity");
+
+    let root_key = RsaPrivateKey::new(&mut rng, 2048).expect("root key");
+    let root_signing = SigningKey::<Sha256>::new(root_key);
+    let root_name = Name::from_str("CN=PoC Root CA,O=StrategicProjects,C=BR").unwrap();
+    let root_cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        root_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(root_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .expect("root builder")
+    .build::<Signature>()
+    .expect("root");
+    let root_der = root_cert.to_der().unwrap();
+
+    let inter_key = RsaPrivateKey::new(&mut rng, 2048).expect("inter key");
+    let inter_signing = SigningKey::<Sha256>::new(inter_key);
+    let inter_name = Name::from_str("CN=PoC Intermediate CA,O=StrategicProjects,C=BR").unwrap();
+    let inter_cert = CertificateBuilder::new(
+        Profile::SubCA {
+            issuer: root_name,
+            path_len_constraint: Some(0),
+        },
+        SerialNumber::from(2u32),
+        validity,
+        inter_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(inter_signing.verifying_key()).unwrap(),
+        &root_signing, // signed by root
+    )
+    .expect("inter builder")
+    .build::<Signature>()
+    .expect("inter");
+    let inter_der = inter_cert.to_der().unwrap();
+
+    let leaf_key = RsaPrivateKey::new(&mut rng, 2048).expect("leaf key");
+    let leaf_signing = SigningKey::<Sha256>::new(leaf_key.clone());
+    let leaf_name = Name::from_str("CN=PoC Signer,O=StrategicProjects,C=BR").unwrap();
+    let leaf_cert = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: inter_name,
+            enable_key_agreement: false,
+            enable_key_encipherment: true,
+        },
+        SerialNumber::from(3u32),
+        validity,
+        leaf_name,
+        SubjectPublicKeyInfoOwned::from_key(leaf_signing.verifying_key()).unwrap(),
+        &inter_signing, // signed by intermediate
+    )
+    .expect("leaf builder")
+    .build::<Signature>()
+    .expect("leaf");
+    let leaf_der = leaf_cert.to_der().unwrap();
+
+    let key_der = leaf_key.to_pkcs8_der().expect("pkcs8").as_bytes().to_vec();
+    let chain = PrivateKeyChain::new(
+        &key_der,
+        b"poc",
+        vec![
+            P12Certificate::from_der(&leaf_der).unwrap(),
+            P12Certificate::from_der(&inter_der).unwrap(),
+            P12Certificate::from_der(&root_der).unwrap(),
+        ],
+    );
+    let mut ks = KeyStore::new();
+    ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
+    (ks.writer(password).write().expect("write p12"), root_der)
+}
