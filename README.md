@@ -48,10 +48,10 @@ $ pdfsig signed.pdf
   digest and the signer's signature, and reports each signature *and* document
   timestamp.
 - **Certificate-chain validation** against a trust store (e.g. the **ICP-Brasil**
-  roots): per-link signature (RSA **and** ECDSA P-256/P-384), validity,
+  roots): per-link signature (RSA, ECDSA P-256/P-384, Ed25519), validity,
   `basicConstraints` / `pathLenConstraint` / `keyCertSign`, **CRL + OCSP**
-  revocation, **name constraints** (§4.2.1.10), and an optional **required
-  policy** OID.
+  revocation, **name constraints** (§4.2.1.10), and the full **policy engine**
+  (`valid_policy_tree`, policy mapping) with an optional required-policy set.
 - **RSA, ECDSA and Ed25519** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA
   P-256/SHA-256 and P-384/SHA-384; Ed25519 per RFC 8419), detected automatically
   from the keystore.
@@ -117,12 +117,13 @@ pdf_signer = { version = "0.1", features = ["https"] }
 
 ## Scope & limitations
 
-- **Path validation** covers the practical RFC 5280 subset: signatures,
-  validity, basic constraints, path length, key usage, CRL + OCSP revocation,
-  **name constraints**, and a **required-policy** OID check. The full policy
-  engine — `valid_policy_tree`, policy *mapping*,
-  `requireExplicitPolicy`/`inhibitPolicyMapping` — is **not** implemented
-  (doing it half-right is worse than not at all).
+- **Path validation** implements RFC 5280 §6.1 broadly: signatures, validity,
+  basic constraints, path length, key usage, CRL + OCSP revocation, name
+  constraints, and the **policy engine** (`valid_policy_tree`, policy mapping,
+  `requireExplicit­Policy`/`inhibitPolicyMapping`/`inhibitAnyPolicy`).
+  ⚠️ **The policy engine is a from-scratch implementation, exercised by the
+  crate's scenario tests but not validated against the NIST PKITS suite** —
+  review it before relying on policy decisions for high-stakes use.
 - **Signing keys**: RSA (SHA-256), ECDSA (P-256/P-384) and Ed25519. Most PDF
   readers (e.g. Adobe) do **not** validate Ed25519 PDF signatures yet — this
   crate's own verifier does.
@@ -142,7 +143,8 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] ECDSA signing keys (P-256 / P-384)
 - [x] RFC 5280 name constraints + required-policy check
 - [x] Ed25519 signing keys; xref-stream incremental updates
-- [ ] Full policy processing (`valid_policy_tree`, policy mapping)
+- [x] RFC 5280 policy engine (valid_policy_tree, policy mapping) — *not yet
+  PKITS-validated*
 - [ ] Richer visible appearances (embedded fonts / images)
 
 ## License

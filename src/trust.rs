@@ -22,19 +22,20 @@ use rsa::RsaPublicKey;
 use sha2::{Sha256, Sha384, Sha512};
 use signature::Verifier;
 use spki::DecodePublicKey;
+use std::collections::BTreeSet;
+
 use const_oid::db::rfc5280::ANY_POLICY;
 use const_oid::ObjectIdentifier;
 use sha1::Sha1;
 use x509_cert::crl::CertificateList;
 use x509_cert::ext::pkix::name::GeneralName;
-use x509_cert::ext::pkix::{
-    BasicConstraints, CertificatePolicies, KeyUsage, NameConstraints, SubjectAltName,
-};
+use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, NameConstraints, SubjectAltName};
 use x509_cert::name::Name;
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, CertId, CertStatus};
 
 use crate::error::Error;
+use crate::policy::{process_policies, PolicyInput};
 use crate::Result;
 
 const MAX_DEPTH: usize = 10;
@@ -188,10 +189,17 @@ fn finalize(path: &[Certificate], store: &TrustStore, _at: i64) -> ChainResult {
     if let Err(detail) = check_name_constraints(path) {
         return fail(&detail);
     }
-    if let Some(policy) = store.required_policy {
-        if let Err(detail) = check_required_policy(path, policy) {
-            return fail(&detail);
-        }
+    // RFC 5280 §6.1 policy processing over the path (excluding the anchor).
+    let certs: Vec<&Certificate> = path[..path.len().saturating_sub(1)].iter().rev().collect();
+    let input = PolicyInput {
+        initial_policy_set: match store.required_policy {
+            Some(p) => BTreeSet::from([p]),
+            None => BTreeSet::from([ANY_POLICY]),
+        },
+        initial_explicit_policy: store.required_policy.is_some(),
+    };
+    if let Err(detail) = process_policies(&certs, &input) {
+        return fail(&detail);
     }
     let anchor = path.last().expect("non-empty path");
     if path.len() == 1 {
@@ -331,42 +339,6 @@ fn uri_host(uri: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
-// --- Certificate policies (practical subset of RFC 5280 §6.1) ----------------
-
-/// The leaf — and every intermediate carrying a policies extension — must
-/// assert `required` (or `anyPolicy`). This is a subset: no policy mapping or
-/// `valid_policy_tree` processing.
-fn check_required_policy(
-    path: &[Certificate],
-    required: ObjectIdentifier,
-) -> std::result::Result<(), String> {
-    let leaf = &path[0];
-    if !asserts_policy(leaf, required) {
-        return Err("leaf does not assert the required certificate policy".into());
-    }
-    // Intermediates (exclude the root anchor at the end).
-    for cert in &path[1..path.len().saturating_sub(1)] {
-        if let Ok(Some((_, pols))) = cert.tbs_certificate.get::<CertificatePolicies>() {
-            if !policy_set_allows(&pols, required) {
-                return Err("an intermediate CA does not allow the required policy".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn asserts_policy(cert: &Certificate, required: ObjectIdentifier) -> bool {
-    match cert.tbs_certificate.get::<CertificatePolicies>() {
-        Ok(Some((_, pols))) => policy_set_allows(&pols, required),
-        _ => false,
-    }
-}
-
-fn policy_set_allows(pols: &CertificatePolicies, required: ObjectIdentifier) -> bool {
-    pols.0
-        .iter()
-        .any(|p| p.policy_identifier == required || p.policy_identifier == ANY_POLICY)
-}
 
 /// True if an OCSP response marks `cert` (under `issuer`) as revoked.
 fn ocsp_revoked(cert: &Certificate, issuer: &Certificate, ocsps: &[BasicOcspResponse]) -> bool {

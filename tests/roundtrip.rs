@@ -1,7 +1,7 @@
 use pdf_signer::testkit::{
-    ca_chain3_p12, ca_name_constrained_p12, ca_signed_p12, ca_with_policy_p12, sample_pdf,
-    sample_pdf_xref_stream, self_signed_ed25519_p12, self_signed_p12, self_signed_p256_p12,
-    self_signed_p384_p12,
+    ca_chain3_p12, ca_chain_policy_mapping_p12, ca_name_constrained_p12, ca_signed_p12,
+    ca_with_policy_p12, sample_pdf, sample_pdf_xref_stream, self_signed_ed25519_p12,
+    self_signed_p12, self_signed_p256_p12, self_signed_p384_p12,
 };
 use pdf_signer::{
     sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
@@ -340,6 +340,39 @@ fn xref_stream_source_gets_xref_stream_update() {
         "incremental update should use an xref stream to match the source"
     );
     assert!(verify_pdf_bytes(&signed).expect("verify").signatures[0].valid);
+}
+
+#[test]
+fn policy_mapping_is_honored() {
+    let pdf = sample_pdf();
+    let a = "1.3.6.1.4.1.99999.10"; // issuer-domain policy
+    let b = "1.3.6.1.4.1.99999.20"; // subject-domain policy (leaf asserts this)
+    let (p12, root_der) = ca_chain_policy_mapping_p12("pw", a, b);
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // Requiring A succeeds: the intermediate maps A -> B and the leaf asserts B.
+    // (The old per-cert subset would have rejected this.)
+    let store = TrustStore::from_ders([root_der.clone()])
+        .unwrap()
+        .require_policy(a)
+        .unwrap();
+    let r = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert_eq!(
+        r.signatures[0].chain_trusted,
+        Some(true),
+        "{}",
+        r.signatures[0].detail
+    );
+
+    // An unrelated policy is rejected.
+    let store2 = TrustStore::from_ders([root_der])
+        .unwrap()
+        .require_policy("1.3.6.1.4.1.99999.30")
+        .unwrap();
+    assert_eq!(
+        verify_pdf_bytes_with_roots(&signed, &store2).unwrap().signatures[0].chain_trusted,
+        Some(false)
+    );
 }
 
 #[test]

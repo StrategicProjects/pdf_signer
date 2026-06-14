@@ -402,6 +402,97 @@ pub fn ca_with_policy_p12(password: &str, policy_oid: &str) -> (Vec<u8>, Vec<u8>
     (p12, root_der)
 }
 
+/// Root → intermediate (asserts `idp`, maps `idp`→`sdp`) → leaf (asserts `sdp`).
+/// Exercises RFC 5280 policy mapping. Returns `(p12, root_der)`.
+pub fn ca_chain_policy_mapping_p12(password: &str, idp: &str, sdp: &str) -> (Vec<u8>, Vec<u8>) {
+    use x509_cert::ext::pkix::certpolicy::PolicyInformation;
+    use x509_cert::ext::pkix::{CertificatePolicies, PolicyMapping, PolicyMappings};
+
+    let idp = ObjectIdentifier::new(idp).unwrap();
+    let sdp = ObjectIdentifier::new(sdp).unwrap();
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap();
+
+    let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let root_signing = SigningKey::<Sha256>::new(root_key);
+    let root_name = Name::from_str("CN=PM Root,O=StrategicProjects,C=BR").unwrap();
+    let root_cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        root_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(root_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap();
+    let root_der = root_cert.to_der().unwrap();
+
+    let inter_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let inter_signing = SigningKey::<Sha256>::new(inter_key);
+    let inter_name = Name::from_str("CN=PM Intermediate,O=StrategicProjects,C=BR").unwrap();
+    let mut inter_builder = CertificateBuilder::new(
+        Profile::SubCA {
+            issuer: root_name,
+            path_len_constraint: Some(0),
+        },
+        SerialNumber::from(2u32),
+        validity,
+        inter_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(inter_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap();
+    inter_builder
+        .add_extension(&CertificatePolicies(vec![PolicyInformation {
+            policy_identifier: idp,
+            policy_qualifiers: None,
+        }]))
+        .unwrap();
+    inter_builder
+        .add_extension(&PolicyMappings(vec![PolicyMapping {
+            issuer_domain_policy: idp,
+            subject_domain_policy: sdp,
+        }]))
+        .unwrap();
+    let inter_cert = inter_builder.build::<Signature>().unwrap();
+    let inter_der = inter_cert.to_der().unwrap();
+
+    let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let leaf_signing = SigningKey::<Sha256>::new(leaf_key.clone());
+    let mut leaf_builder = CertificateBuilder::new(
+        leaf_profile(inter_name),
+        SerialNumber::from(3u32),
+        validity,
+        Name::from_str("CN=PM Leaf,O=StrategicProjects,C=BR").unwrap(),
+        SubjectPublicKeyInfoOwned::from_key(leaf_signing.verifying_key()).unwrap(),
+        &inter_signing,
+    )
+    .unwrap();
+    leaf_builder
+        .add_extension(&CertificatePolicies(vec![PolicyInformation {
+            policy_identifier: sdp,
+            policy_qualifiers: None,
+        }]))
+        .unwrap();
+    let leaf_cert = leaf_builder.build::<Signature>().unwrap();
+
+    let key_der = leaf_key.to_pkcs8_der().unwrap().as_bytes().to_vec();
+    let chain = PrivateKeyChain::new(
+        &key_der,
+        b"poc",
+        vec![
+            P12Certificate::from_der(&leaf_cert.to_der().unwrap()).unwrap(),
+            P12Certificate::from_der(&inter_der).unwrap(),
+            P12Certificate::from_der(&root_der).unwrap(),
+        ],
+    );
+    let mut ks = KeyStore::new();
+    ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
+    (ks.writer(password).write().unwrap(), root_der)
+}
+
 fn leaf_profile(issuer: Name) -> Profile {
     Profile::Leaf {
         issuer,

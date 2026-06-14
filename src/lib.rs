@@ -24,6 +24,7 @@ mod crypto;
 mod dss;
 mod error;
 mod incremental;
+mod policy;
 mod sign;
 pub mod testkit;
 mod trust;
