@@ -1,6 +1,6 @@
 [package]
 name = "pdf_signer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.74"
 description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PoC)."
@@ -35,6 +35,9 @@ rand = "0.8"
 # ECDSA chain verification (P-256 / P-384), for ICP-Brasil EC chains.
 p256 = "0.13"
 p384 = "0.13"
+# OCSP revocation (requests + response parsing).
+x509-ocsp = { version = "0.2", features = ["builder"] }
+sha1 = { version = "0.10", features = ["oid"] }
 
 # Optional: HTTPS for TSA / CRL endpoints (rustls). Off by default to keep the
 # base crate pure-Rust and lean; enable for ICP-Brasil HTTPS TSAs.

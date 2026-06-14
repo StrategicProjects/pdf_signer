@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use der::Decode;
 use x509_cert::crl::CertificateList;
+use x509_ocsp::{BasicOcspResponse, OcspResponse};
 
 use crate::crypto::{cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
 use crate::error::Error;
@@ -17,6 +18,16 @@ use crate::Result;
 fn parse_crls(ders: &[Vec<u8>]) -> Vec<CertificateList> {
     ders.iter()
         .filter_map(|d| CertificateList::from_der(d).ok())
+        .collect()
+}
+
+/// Parse OCSP response DER blobs into their inner `BasicOCSPResponse`.
+fn parse_ocsps(ders: &[Vec<u8>]) -> Vec<BasicOcspResponse> {
+    ders.iter()
+        .filter_map(|d| {
+            let rb = OcspResponse::from_der(d).ok()?.response_bytes?;
+            BasicOcspResponse::from_der(rb.response.as_bytes()).ok()
+        })
         .collect()
 }
 
@@ -131,7 +142,8 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
     if !is_timestamp && !roots.is_empty() {
         if let Ok((leaf, pool)) = signer_certificate_and_pool(&der) {
             let crls = parse_crls(&crate::dss::extract_dss_crls(pdf));
-            let result = verify_chain(&leaf, &pool, roots, &crls, SystemTime::now());
+            let ocsps = parse_ocsps(&crate::dss::extract_dss_ocsps(pdf));
+            let result = verify_chain(&leaf, &pool, roots, &crls, &ocsps, SystemTime::now());
             chain_trusted = Some(result.trusted);
             detail = format!("{detail}; chain: {}", result.detail);
         } else {

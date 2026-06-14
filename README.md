@@ -41,14 +41,16 @@ $ pdfsig signed.pdf
   **multiple signatures** compose and earlier ones stay valid.
 - **RFC 3161 timestamps** — signature timestamps (B-T) and document timestamps
   (B-LTA), from any TSA.
-- **Long-term validation material** — a `/DSS` with the full certificate chain
-  and CRLs fetched from the certificates' distribution points (B-LT).
+- **Long-term validation material** — a `/DSS` with the full certificate chain,
+  CRLs **and OCSP responses** fetched from the certificates' distribution points
+  / responders (B-LT).
 - **Verification** — re-derives the signed byte range, checks the message
   digest and the signer's signature, and reports each signature *and* document
   timestamp.
 - **Certificate-chain validation** against a trust store (e.g. the **ICP-Brasil**
   roots): per-link signature (RSA **and** ECDSA P-256/P-384), validity,
-  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, and CRL revocation.
+  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, and **CRL + OCSP**
+  revocation.
 - **Pure Rust**, with an optional `https` feature (rustls) for TLS endpoints.
 
 ### PAdES levels
@@ -111,10 +113,9 @@ pdf_signer = { version = "0.1", features = ["https"] }
 
 ## Scope & limitations
 
-- **Revocation** uses **CRLs only** (no OCSP yet).
 - **Path validation** covers the practical RFC 5280 subset (signatures,
-  validity, basic constraints, path length, key usage, CRL revocation) — **not**
-  name constraints or certificate policies.
+  validity, basic constraints, path length, key usage, **CRL + OCSP**
+  revocation) — **not** name constraints or certificate policies.
 - **Signing keys are RSA** (PKCS#1 v1.5 + SHA-256); ECDSA is supported on the
   **verification** side (chain), not yet for the signer key.
 - Incremental updates use a **traditional xref table** (chained via `/Prev`),
@@ -127,10 +128,10 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] Pure-Rust CMS signing & verification (no OpenSSL/Java)
 - [x] Visible appearance, incremental updates, multi-signature
 - [x] PAdES B-B / B-T / B-LT / B-LTA (DSS + document timestamp)
-- [x] Certificate-chain validation (RSA + ECDSA, CRL revocation, RFC 5280 subset)
-- [x] Optional HTTPS (rustls) for TSA / CRL
+- [x] Certificate-chain validation (RSA + ECDSA, CRL + OCSP, RFC 5280 subset)
+- [x] Optional HTTPS (rustls) for TSA / CRL / OCSP
 - [x] [extendr](https://extendr.github.io/) bindings + vendoring for R / CRAN
-- [ ] OCSP revocation; ECDSA *signing* keys
+- [ ] ECDSA *signing* keys
 - [ ] Full RFC 5280 path processing (name constraints, policies)
 - [ ] xref-stream incremental updates; richer appearances (fonts/images)
 

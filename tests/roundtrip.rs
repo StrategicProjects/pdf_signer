@@ -183,6 +183,9 @@ fn pades_blta_builds_dss_and_document_timestamp() {
 
     assert!(contains(&signed, b"/DSS"), "Document Security Store");
     assert!(contains(&signed, b"/Certs"), "DSS certificates");
+    // The DigiCert TSA chain has AIA, so CRLs + OCSP responses get embedded.
+    assert!(contains(&signed, b"/CRLs"), "DSS CRLs");
+    assert!(contains(&signed, b"/OCSPs"), "DSS OCSP responses");
     assert!(contains(&signed, b"DocTimeStamp"), "document timestamp");
     assert!(contains(&signed, b"ETSI.RFC3161"), "doc-timestamp SubFilter");
 

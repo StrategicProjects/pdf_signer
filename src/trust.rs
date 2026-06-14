@@ -21,9 +21,11 @@ use rsa::RsaPublicKey;
 use sha2::{Sha256, Sha384, Sha512};
 use signature::Verifier;
 use spki::DecodePublicKey;
+use sha1::Sha1;
 use x509_cert::crl::CertificateList;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
 use x509_cert::Certificate;
+use x509_ocsp::{BasicOcspResponse, CertId, CertStatus};
 
 use crate::error::Error;
 use crate::Result;
@@ -88,6 +90,7 @@ pub(crate) fn verify_chain(
     pool: &[Certificate],
     store: &TrustStore,
     crls: &[CertificateList],
+    ocsps: &[BasicOcspResponse],
     at: SystemTime,
 ) -> ChainResult {
     let at = at
@@ -102,7 +105,7 @@ pub(crate) fn verify_chain(
             return fail("a certificate in the path is expired or not yet valid");
         }
         if is_revoked(&current, crls) {
-            return fail("a certificate in the path has been revoked");
+            return fail("a certificate in the path has been revoked (CRL)");
         }
         // Signer certificate is itself a trusted root.
         if store.roots.iter().any(|r| same_cert(r, &current)) {
@@ -110,6 +113,9 @@ pub(crate) fn verify_chain(
         }
         // Directly issued by a trusted root.
         if let Some(root) = store.roots.iter().find(|r| issued_by(&current, r)) {
+            if ocsp_revoked(&current, root, ocsps) {
+                return fail("a certificate in the path has been revoked (OCSP)");
+            }
             if !valid_at(root, at) {
                 return fail("trusted root is expired");
             }
@@ -133,6 +139,9 @@ pub(crate) fn verify_chain(
                 if !permits_cert_sign(next) {
                     return fail("intermediate CA lacks keyCertSign key usage");
                 }
+                if ocsp_revoked(&current, next, ocsps) {
+                    return fail("a certificate in the path has been revoked (OCSP)");
+                }
                 intermediates += 1;
                 current = next.clone();
             }
@@ -140,6 +149,33 @@ pub(crate) fn verify_chain(
         }
     }
     fail("certificate path too long")
+}
+
+/// True if an OCSP response marks `cert` (under `issuer`) as revoked.
+fn ocsp_revoked(cert: &Certificate, issuer: &Certificate, ocsps: &[BasicOcspResponse]) -> bool {
+    let Ok(want) =
+        CertId::from_issuer::<Sha1>(issuer, cert.tbs_certificate.serial_number.clone())
+    else {
+        return false;
+    };
+    for basic in ocsps {
+        for single in basic.tbs_response_data.responses.iter() {
+            if cert_id_eq(&single.cert_id, &want)
+                && matches!(single.cert_status, CertStatus::Revoked(_))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Compare two `CertID`s by name hash, key hash and serial (ignoring the hash
+/// algorithm's encoding nuances).
+fn cert_id_eq(a: &CertId, b: &CertId) -> bool {
+    a.issuer_name_hash.as_bytes() == b.issuer_name_hash.as_bytes()
+        && a.issuer_key_hash.as_bytes() == b.issuer_key_hash.as_bytes()
+        && a.serial_number.to_der().ok() == b.serial_number.to_der().ok()
 }
 
 fn ok(detail: &str) -> ChainResult {
