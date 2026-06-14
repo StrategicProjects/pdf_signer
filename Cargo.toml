@@ -1,0 +1,22 @@
+[package]
+name = "pdf_signer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PoC)."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/StrategicProjects/pdf_signer"
+readme = "README.md"
+
+[lib]
+name = "pdf_signer"
+crate-type = ["lib"]
+
+[[bin]]
+name = "pdf_signer"
+path = "src/main.rs"
+
+[dependencies]
+lopdf = "0.36"
+openssl = "0.10"
+thiserror = "2"
