@@ -1,6 +1,6 @@
 [package]
 name = "pdf_signer"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.74"
 description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PoC)."
@@ -20,6 +20,9 @@ path = "src/main.rs"
 lopdf = "0.36"
 thiserror = "2"
 flate2 = "1"
+# Richer visible appearances: embedded TrueType fonts and PNG/JPEG logos.
+ttf-parser = "0.25"
+png = "0.18"
 
 # Pure-Rust crypto stack (no OpenSSL / system libs) for a vendorable CRAN build.
 # x509-cert is pulled in transitively by cms; we use its `builder` for testkit.

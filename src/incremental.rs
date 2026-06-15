@@ -197,8 +197,8 @@ fn uses_xref_stream(buf: &[u8]) -> bool {
     !buf[i..].starts_with(b"xref")
 }
 
-/// Zlib-compress (PDF `FlateDecode`) the cross-reference stream data.
-fn zlib_compress(data: &[u8]) -> Vec<u8> {
+/// Zlib-compress (PDF `FlateDecode`).
+pub(crate) fn zlib_compress(data: &[u8]) -> Vec<u8> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;

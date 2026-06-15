@@ -53,6 +53,7 @@ fn cmd_sign(args: &[String]) -> ExitCode {
             font_size: 8.0,
             text: box_text,
             border: true,
+            ..Default::default()
         }),
         ..Default::default()
     };

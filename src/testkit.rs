@@ -154,6 +154,24 @@ fn ec_p12(password: &str, key_der: &[u8], cert_der: &[u8]) -> Vec<u8> {
     ks.writer(password).write().unwrap()
 }
 
+/// A tiny 4×4 RGBA PNG (opaque red), for testing image appearances.
+pub fn tiny_png() -> Vec<u8> {
+    let (w, h) = (4u32, 4u32);
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..(w * h) {
+        pixels.extend_from_slice(&[220, 30, 30, 255]);
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer.write_image_data(&pixels).unwrap();
+    }
+    out
+}
+
 /// A minimal one-page PDF that uses a **cross-reference stream** (PDF 1.5)
 /// instead of a traditional xref table, for testing the xref-stream path.
 pub fn sample_pdf_xref_stream() -> Vec<u8> {

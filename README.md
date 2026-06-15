@@ -36,7 +36,8 @@ $ pdfsig signed.pdf
 
 - **PAdES B-B → B-LTA** detached CMS signatures (`ETSI.CAdES.detached`).
 - **Visible or invisible** signatures — a bordered text box (the signing
-  statement + validation link) at any position on any page, with word wrap.
+  statement + validation link) at any position on any page, with word wrap,
+  an optional **embedded TrueType font** and a **PNG/JPEG logo**.
 - **True incremental updates** — the original bytes are never rewritten, so
   **multiple signatures** compose and earlier ones stay valid.
 - **RFC 3161 timestamps** — signature timestamps (B-T) and document timestamps
@@ -129,8 +130,10 @@ pdf_signer = { version = "0.1", features = ["https"] }
   crate's own verifier does.
 - Incremental updates match the source: a **traditional xref table** *or* a
   **cross-reference stream** (auto-detected), chained via `/Prev`.
-- Visible appearances use **standard Helvetica** (WinAnsi); no embedded
-  fonts/images, approximate line wrapping.
+- Visible appearances can **embed a TrueType font** (a *simple* WinAnsi font —
+  Latin-1, not Type0/Unicode, so non-Latin-1 glyphs become `?`) and a **PNG or
+  JPEG logo**; the default font is standard Helvetica. Line wrapping is
+  approximate (character-count).
 
 ## Roadmap
 
@@ -145,7 +148,7 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] Ed25519 signing keys; xref-stream incremental updates
 - [x] RFC 5280 policy engine (valid_policy_tree, policy mapping) — *not yet
   PKITS-validated*
-- [ ] Richer visible appearances (embedded fonts / images)
+- [x] Richer visible appearances (embedded TrueType fonts + PNG/JPEG images)
 
 ## License
 

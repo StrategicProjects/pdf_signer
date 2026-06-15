@@ -20,6 +20,7 @@
 //! * CMS is produced via the system OpenSSL (`openssl` crate). A pure-Rust
 //!   RustCrypto backend is the path for a CRAN-friendly, vendored build.
 
+mod appearance;
 mod crypto;
 mod dss;
 mod error;

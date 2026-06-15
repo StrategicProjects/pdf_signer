@@ -1,7 +1,7 @@
 use pdf_signer::testkit::{
     ca_chain3_p12, ca_chain_policy_mapping_p12, ca_name_constrained_p12, ca_signed_p12,
     ca_with_policy_p12, sample_pdf, sample_pdf_xref_stream, self_signed_ed25519_p12,
-    self_signed_p12, self_signed_p256_p12, self_signed_p384_p12,
+    self_signed_p12, self_signed_p256_p12, self_signed_p384_p12, tiny_png,
 };
 use pdf_signer::{
     sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
@@ -373,6 +373,47 @@ fn policy_mapping_is_honored() {
         verify_pdf_bytes_with_roots(&signed, &store2).unwrap().signatures[0].chain_trusted,
         Some(false)
     );
+}
+
+#[test]
+fn appearance_embeds_png_image() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        appearance: Some(Appearance {
+            text: "Signed with a logo".into(),
+            image: Some(tiny_png()),
+            ..Appearance::default()
+        }),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("sign");
+
+    assert!(contains(&signed, b"/Subtype /Image"), "image XObject present");
+    assert!(contains(&signed, b"/SMask"), "RGBA image gets a soft mask");
+    assert!(contains(&signed, b"/Img Do"), "image is drawn in the content");
+    assert!(verify_pdf_bytes(&signed).expect("verify").signatures[0].valid);
+}
+
+#[test]
+#[ignore = "reads a macOS system TrueType font"]
+fn appearance_embeds_truetype_font() {
+    let font = std::fs::read("/System/Library/Fonts/Supplemental/Andale Mono.ttf")
+        .expect("system TrueType font");
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        appearance: Some(Appearance {
+            text: "Embedded font".into(),
+            font: Some(font),
+            ..Appearance::default()
+        }),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("sign");
+    assert!(contains(&signed, b"/FontFile2"), "font program embedded");
+    assert!(contains(&signed, b"/TrueType"), "TrueType simple font");
+    assert!(verify_pdf_bytes(&signed).expect("verify").signatures[0].valid);
 }
 
 #[test]
