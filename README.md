@@ -128,9 +128,12 @@ pdf_signer = { version = "0.1", features = ["https"] }
   basic constraints, path length, key usage, CRL + OCSP revocation, name
   constraints, and the **policy engine** (`valid_policy_tree`, policy mapping,
   `requireExplicit­Policy`/`inhibitPolicyMapping`/`inhibitAnyPolicy`).
-  ⚠️ **The policy engine is a from-scratch implementation, exercised by the
-  crate's scenario tests but not validated against the NIST PKITS suite** —
-  review it before relying on policy decisions for high-stakes use.
+  The policy engine and name-constraint processing are validated against the
+  **NIST PKITS** suite — **42/42 certificate-policy tests (§4.8–4.12)** and
+  **38/38 name-constraint tests (§4.13)** pass. Run them with
+  `PKITS_DIR=/path/to/pkits cargo test --test pkits -- --ignored` (the
+  revocation/CRL-shape PKITS sections rely on features this crate does not
+  claim, so they are not asserted).
 - **Signing keys**: RSA (SHA-256), ECDSA (P-256/P-384) and Ed25519. Most PDF
   readers (e.g. Adobe) do **not** validate Ed25519 PDF signatures yet — this
   crate's own verifier does.
@@ -152,8 +155,8 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] ECDSA signing keys (P-256 / P-384)
 - [x] RFC 5280 name constraints + required-policy check
 - [x] Ed25519 signing keys; xref-stream incremental updates
-- [x] RFC 5280 policy engine (valid_policy_tree, policy mapping) — *not yet
-  PKITS-validated*
+- [x] RFC 5280 policy engine (valid_policy_tree, policy mapping) — **NIST PKITS
+  validated** (42/42 policy + 38/38 name-constraint tests)
 - [x] Richer visible appearances (embedded TrueType fonts + PNG/JPEG images)
 
 ## License

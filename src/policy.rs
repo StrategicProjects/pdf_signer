@@ -64,8 +64,14 @@ pub(crate) fn process_policies(
         // §6.1.3 (d)/(e): update the tree with this certificate's policies.
         match cert_policies(cert) {
             Some(policies) => {
-                let is_ca = !is_last;
-                update_tree(&mut nodes, i, &policies, inhibit_anypolicy, is_ca);
+                update_tree(
+                    &mut nodes,
+                    i,
+                    &policies,
+                    inhibit_anypolicy,
+                    !is_last,
+                    is_self_issued(cert),
+                );
             }
             None => nodes.clear(), // (e) valid_policy_tree = NULL
         }
@@ -129,7 +135,8 @@ fn update_tree(
     i: usize,
     policies: &BTreeSet<ObjectIdentifier>,
     inhibit_anypolicy: usize,
-    is_ca: bool,
+    not_last: bool,
+    self_issued: bool,
 ) {
     if tree_is_null(nodes) {
         return;
@@ -155,9 +162,10 @@ fn update_tree(
         }
     }
 
-    // (d)(2): the certificate asserts anyPolicy.
+    // (d)(2): the certificate asserts anyPolicy. Processed only if anyPolicy is
+    // not inhibited, or this is a non-final self-issued certificate.
     let asserts_any = policies.contains(&ANY_POLICY);
-    if asserts_any && (inhibit_anypolicy > 0 || is_ca) {
+    if asserts_any && (inhibit_anypolicy > 0 || (not_last && self_issued)) {
         for &pi in &parents {
             let expected: Vec<ObjectIdentifier> =
                 nodes[pi].expected_policy_set.iter().copied().collect();
@@ -356,7 +364,7 @@ fn inhibit_any_policy(cert: &Certificate) -> Option<u32> {
         .map(|(_, v)| v.0)
 }
 
-fn is_self_issued(cert: &Certificate) -> bool {
+pub(crate) fn is_self_issued(cert: &Certificate) -> bool {
     matches!(
         (
             cert.tbs_certificate.subject.to_der(),

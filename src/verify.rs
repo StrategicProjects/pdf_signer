@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use der::Decode;
 use x509_cert::crl::CertificateList;
+use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, OcspResponse};
 
 use crate::crypto::{cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
@@ -13,6 +14,28 @@ use crate::error::Error;
 use crate::trust::{verify_chain, TrustStore};
 use crate::util::{der_total_len, find_sub, hex_decode};
 use crate::Result;
+
+/// Validate a certificate path directly (decoupled from PDF signing): does
+/// `leaf_der` chain to a trusted root in `roots`, using `pool_ders` as candidate
+/// intermediates and `crl_ders` for revocation, at time `at`? Exposed mainly for
+/// conformance testing (e.g. NIST PKITS).
+pub fn verify_certificate_chain(
+    leaf_der: &[u8],
+    pool_ders: &[Vec<u8>],
+    crl_ders: &[Vec<u8>],
+    roots: &TrustStore,
+    at: SystemTime,
+) -> bool {
+    let Ok(leaf) = Certificate::from_der(leaf_der) else {
+        return false;
+    };
+    let pool: Vec<Certificate> = pool_ders
+        .iter()
+        .filter_map(|d| Certificate::from_der(d).ok())
+        .collect();
+    let crls = parse_crls(crl_ders);
+    verify_chain(&leaf, &pool, roots, &crls, &[], at).trusted
+}
 
 /// Parse CRL DER blobs, silently dropping any that fail to decode.
 fn parse_crls(ders: &[Vec<u8>]) -> Vec<CertificateList> {

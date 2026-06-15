@@ -20,7 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Sign a PDF with a PKCS#12 keystore.
-    Sign(SignArgs),
+    Sign(Box<SignArgs>),
     /// Verify the signatures in a PDF.
     Verify(VerifyArgs),
 }
@@ -117,7 +117,7 @@ struct VerifyArgs {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Sign(a) => run_sign(a),
+        Command::Sign(a) => run_sign(*a),
         Command::Verify(a) => run_verify(a),
     }
 }

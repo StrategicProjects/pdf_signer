@@ -30,7 +30,7 @@ use sha1::Sha1;
 use x509_cert::crl::CertificateList;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, NameConstraints, SubjectAltName};
-use x509_cert::name::Name;
+use x509_cert::name::{Name, RelativeDistinguishedName};
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, CertId, CertStatus};
 
@@ -216,9 +216,14 @@ fn finalize(path: &[Certificate], store: &TrustStore, _at: i64) -> ChainResult {
 fn check_name_constraints(path: &[Certificate]) -> std::result::Result<(), String> {
     let mut collected: Vec<NameConstraints> = Vec::new();
     // Walk from the root (trust anchor, unchecked) down to the leaf.
+    // `path[0]` is the leaf (the "final certificate" in RFC 5280 §6.1 terms).
     for (i, cert) in path.iter().enumerate().rev() {
         let is_anchor = i == path.len() - 1;
-        if !is_anchor {
+        // RFC 5280 §6.1.3 (b)/(c): a self-issued certificate that is not the
+        // final certificate in the path is exempt from the subject name-constraint
+        // check (its name is an artefact of a key rollover, not a new identity).
+        let exempt_self_issued = i != 0 && crate::policy::is_self_issued(cert);
+        if !is_anchor && !exempt_self_issued {
             for name in cert_names(cert) {
                 for nc in &collected {
                     if name_excluded(&name, nc) {
@@ -237,13 +242,38 @@ fn check_name_constraints(path: &[Certificate]) -> std::result::Result<(), Strin
     Ok(())
 }
 
-/// The constrained names of a certificate: its subject DN plus any SANs.
+/// The PKCS#9 `emailAddress` attribute OID (`1.2.840.113549.1.9.1`). RFC 5280
+/// §4.2.1.10 requires `rfc822Name` constraints to also bind a legacy email
+/// address carried in this subject-DN attribute.
+const EMAIL_ADDRESS_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
+
+/// The constrained names of a certificate: its subject DN (when non-empty), any
+/// SANs, and any legacy `emailAddress` attribute in the subject DN promoted to an
+/// `rfc822Name` (RFC 5280 §4.2.1.10).
 fn cert_names(cert: &Certificate) -> Vec<GeneralName> {
-    let mut names = vec![GeneralName::DirectoryName(cert.tbs_certificate.subject.clone())];
+    let mut names = Vec::new();
+    if !cert.tbs_certificate.subject.0.is_empty() {
+        names.push(GeneralName::DirectoryName(cert.tbs_certificate.subject.clone()));
+    }
+    for rdn in cert.tbs_certificate.subject.0.iter() {
+        for atv in rdn.0.iter() {
+            if atv.oid == EMAIL_ADDRESS_OID {
+                if let Ok(email) = der::asn1::Ia5String::new(&value_string(atv)) {
+                    names.push(GeneralName::Rfc822Name(email));
+                }
+            }
+        }
+    }
     if let Ok(Some((_, san))) = cert.tbs_certificate.get::<SubjectAltName>() {
         names.extend(san.0.iter().cloned());
     }
     names
+}
+
+/// Best-effort decode of an `AttributeTypeAndValue` value into its string content.
+fn value_string(atv: &x509_cert::attr::AttributeTypeAndValue) -> String {
+    let bytes = atv.value.value();
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn name_excluded(name: &GeneralName, nc: &NameConstraints) -> bool {
@@ -284,13 +314,26 @@ fn within_subtree(name: &GeneralName, base: &GeneralName) -> Option<bool> {
             Some(ip_within(n.as_bytes(), b.as_bytes()))
         }
         (GeneralName::UniformResourceIdentifier(n), GeneralName::UniformResourceIdentifier(b)) => {
-            Some(dns_within(uri_host(n.as_str()), b.as_str()))
+            Some(host_within(uri_host(n.as_str()), b.as_str()))
         }
         _ => None,
     }
 }
 
-/// A DN is within a base subtree if the base RDN sequence is a prefix of it.
+/// Host-based matching (URI/email): an exact host unless the base begins with a
+/// period, which then matches subdomains only (not the bare domain).
+fn host_within(host: &str, base: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    let b = base.to_ascii_lowercase();
+    match b.strip_prefix('.') {
+        Some(domain) => h.ends_with(&format!(".{domain}")),
+        None => h == b,
+    }
+}
+
+/// A DN is within a base subtree if the base RDN sequence is a prefix of it,
+/// comparing RDNs case-insensitively and ignoring the DirectoryString encoding
+/// (PrintableString vs UTF8String) — a practical subset of RFC 5280 §7.1.
 fn dn_within(name: &Name, base: &Name) -> bool {
     if base.0.len() > name.0.len() {
         return false;
@@ -298,7 +341,22 @@ fn dn_within(name: &Name, base: &Name) -> bool {
     base.0
         .iter()
         .zip(name.0.iter())
-        .all(|(b, n)| b.to_der().ok() == n.to_der().ok())
+        .all(|(b, n)| rdn_key(b) == rdn_key(n))
+}
+
+/// Normalize an RDN to a set of `(attribute oid, folded value)` pairs.
+fn rdn_key(rdn: &RelativeDistinguishedName) -> BTreeSet<(ObjectIdentifier, String)> {
+    rdn.0
+        .iter()
+        .map(|atv| {
+            let folded = String::from_utf8_lossy(atv.value.value())
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            (atv.oid, folded)
+        })
+        .collect()
 }
 
 fn dns_within(name: &str, base: &str) -> bool {
@@ -314,10 +372,12 @@ fn email_within(name: &str, base: &str) -> bool {
     let n = name.to_ascii_lowercase();
     let b = base.to_ascii_lowercase();
     if b.contains('@') {
-        return n == b;
+        return n == b; // exact mailbox
     }
-    let host = n.split('@').nth(1).unwrap_or(&n);
-    dns_within(host, &b)
+    match n.split_once('@') {
+        Some((_, host)) => host_within(host, &b),
+        None => false,
+    }
 }
 
 fn ip_within(name: &[u8], base: &[u8]) -> bool {

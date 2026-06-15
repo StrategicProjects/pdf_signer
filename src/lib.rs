@@ -37,8 +37,8 @@ pub use error::Error;
 pub use sign::{sign_pdf_bytes, sign_pdf_file, Appearance, PadesLevel, SignOptions};
 pub use trust::TrustStore;
 pub use verify::{
-    verify_pdf_bytes, verify_pdf_bytes_with_roots, verify_pdf_file, verify_pdf_file_with_roots,
-    SignatureReport, VerifiedSignature,
+    verify_certificate_chain, verify_pdf_bytes, verify_pdf_bytes_with_roots, verify_pdf_file,
+    verify_pdf_file_with_roots, SignatureReport, VerifiedSignature,
 };
 
 /// Convenience result type for the crate.
