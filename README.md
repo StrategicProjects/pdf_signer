@@ -5,6 +5,10 @@
 [![PAdES](https://img.shields.io/badge/PAdES-B--B%20%E2%86%92%20B--LTA-success.svg)](#pades-levels)
 ![pure Rust](https://img.shields.io/badge/crypto-pure%20RustCrypto-success.svg)
 
+**Also available as:**
+[![R package: pdfsigner](https://img.shields.io/badge/R-pdfsigner-276DC3?logo=r&logoColor=white)](https://github.com/StrategicProjects/pdfsigner)
+[![PyPI: pdfsignerpy](https://img.shields.io/badge/PyPI-pdfsignerpy-3776AB?logo=python&logoColor=white)](https://pypi.org/project/pdfsignerpy/)
+
 A self-contained Rust library + CLI to **digitally sign** PDF documents with a
 PKCS#12 keystore and **verify** their signatures — implementing the **PAdES**
 baseline profiles (ETSI EN 319 142) from **B-B all the way to B-LTA**.
