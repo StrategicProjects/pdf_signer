@@ -1,65 +1,164 @@
-//! Thin CLI around the `pdf_signer` library.
-//!
-//! ```text
-//! pdf_signer sign   <input.pdf> <output.pdf> <keystore.p12> <password> [reason]
-//! pdf_signer verify <signed.pdf>
-//! ```
+//! `pdf_signer` command-line interface.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use pdf_signer::{sign_pdf_file, verify_pdf_file, Appearance, PadesLevel, SignOptions};
+use clap::{Parser, Subcommand, ValueEnum};
+use pdf_signer::{
+    sign_pdf_file, verify_pdf_file, verify_pdf_file_with_roots, Appearance, PadesLevel,
+    SignOptions, TrustStore,
+};
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("sign") => cmd_sign(&args),
-        Some("verify") => cmd_verify(&args),
-        _ => {
-            eprintln!("usage:");
-            eprintln!("  pdf_signer sign   <input.pdf> <output.pdf> <keystore.p12> <password> [reason]");
-            eprintln!("  pdf_signer verify <signed.pdf>");
-            ExitCode::from(2)
+/// Sign and verify PDF documents (pure-Rust PAdES).
+#[derive(Parser)]
+#[command(name = "pdf_signer", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Sign a PDF with a PKCS#12 keystore.
+    Sign(SignArgs),
+    /// Verify the signatures in a PDF.
+    Verify(VerifyArgs),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Level {
+    /// Baseline (signing-certificate-v2).
+    Bb,
+    /// + RFC 3161 signature timestamp.
+    Bt,
+    /// + DSS (certificate chain, CRLs, OCSP).
+    Blt,
+    /// + document timestamp over the whole file.
+    Blta,
+}
+
+impl From<Level> for PadesLevel {
+    fn from(l: Level) -> Self {
+        match l {
+            Level::Bb => PadesLevel::Bb,
+            Level::Bt => PadesLevel::Bt,
+            Level::Blt => PadesLevel::Blt,
+            Level::Blta => PadesLevel::Blta,
         }
     }
 }
 
-fn cmd_sign(args: &[String]) -> ExitCode {
-    if args.len() < 6 {
-        eprintln!("sign: need <input.pdf> <output.pdf> <keystore.p12> <password> [reason] [tsa_url] [bb|bt|blt|blta]");
-        return ExitCode::from(2);
+#[derive(Parser)]
+struct SignArgs {
+    /// Input PDF.
+    input: PathBuf,
+    /// Output (signed) PDF.
+    output: PathBuf,
+    /// PKCS#12 (.p12/.pfx) keystore.
+    keystore: PathBuf,
+    /// Keystore password.
+    #[arg(short, long, env = "KEY_PASSWORD")]
+    password: String,
+
+    /// PAdES level. `bt`+ require `--tsa-url`.
+    #[arg(long, value_enum, default_value = "bb")]
+    level: Level,
+    /// RFC 3161 Time-Stamping Authority URL (http:// or, with the `https`
+    /// feature, https://).
+    #[arg(long)]
+    tsa_url: Option<String>,
+
+    /// `/Reason` for signing.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Signer `/Name`.
+    #[arg(long)]
+    name: Option<String>,
+    /// `/Location`.
+    #[arg(long)]
+    location: Option<String>,
+
+    /// Draw a visible signature box with this text (enables a visible signature).
+    #[arg(long)]
+    text: Option<String>,
+    /// Page for the visible box (1-based).
+    #[arg(long, default_value_t = 1)]
+    page: usize,
+    /// Visible box geometry, in points.
+    #[arg(long, default_value_t = 36.0)]
+    x: f64,
+    #[arg(long, default_value_t = 36.0)]
+    y: f64,
+    #[arg(long, default_value_t = 320.0)]
+    width: f64,
+    #[arg(long, default_value_t = 64.0)]
+    height: f64,
+    #[arg(long, default_value_t = 8.0)]
+    font_size: f64,
+    /// Drop the box border.
+    #[arg(long)]
+    no_border: bool,
+    /// TrueType/OpenType font file to embed in the box.
+    #[arg(long)]
+    font: Option<PathBuf>,
+    /// PNG/JPEG logo to draw in the box.
+    #[arg(long)]
+    image: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct VerifyArgs {
+    /// PDF to verify.
+    input: PathBuf,
+    /// PEM file of trusted roots (e.g. ICP-Brasil). Enables chain validation.
+    #[arg(long)]
+    roots: Option<PathBuf>,
+}
+
+fn main() -> ExitCode {
+    match Cli::parse().command {
+        Command::Sign(a) => run_sign(a),
+        Command::Verify(a) => run_verify(a),
     }
-    let reason = args.get(6).cloned();
-    let box_text = format!(
-        "{}\nAssinado digitalmente por pdf_signer PoC (StrategicProjects).\nValidar em: apps.example.org/validate",
-        reason.as_deref().unwrap_or("Documento assinado digitalmente")
-    );
-    let level = match args.get(8).map(String::as_str) {
-        Some("bt") => PadesLevel::Bt,
-        Some("blt") => PadesLevel::Blt,
-        Some("blta") => PadesLevel::Blta,
-        _ => PadesLevel::Bb,
+}
+
+fn run_sign(a: SignArgs) -> ExitCode {
+    let appearance = a.text.as_ref().map(|text| {
+        Ok::<_, std::io::Error>(Appearance {
+            page: a.page,
+            x: a.x,
+            y: a.y,
+            width: a.width,
+            height: a.height,
+            font_size: a.font_size,
+            text: text.clone(),
+            border: !a.no_border,
+            font: a.font.as_ref().map(std::fs::read).transpose()?,
+            image: a.image.as_ref().map(std::fs::read).transpose()?,
+            image_rect: None,
+        })
+    });
+    let appearance = match appearance.transpose() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: reading font/image: {e}");
+            return ExitCode::FAILURE;
+        }
     };
+
     let opts = SignOptions {
-        reason,
-        name: Some("pdf_signer PoC".to_string()),
-        tsa_url: args.get(7).cloned(), // optional RFC 3161 TSA http:// URL
-        pades_level: level,
-        appearance: Some(Appearance {
-            page: 1,
-            x: 36.0,
-            y: 36.0,
-            width: 320.0,
-            height: 64.0,
-            font_size: 8.0,
-            text: box_text,
-            border: true,
-            ..Default::default()
-        }),
+        reason: a.reason,
+        name: a.name,
+        location: a.location,
+        tsa_url: a.tsa_url,
+        pades_level: a.level.into(),
+        appearance,
         ..Default::default()
     };
-    match sign_pdf_file(&args[2], &args[3], &args[4], &args[5], &opts) {
+
+    match sign_pdf_file(&a.input, &a.output, &a.keystore, &a.password, &opts) {
         Ok(()) => {
-            println!("signed: {} -> {}", args[2], args[3]);
+            println!("signed: {} -> {}", a.input.display(), a.output.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -69,35 +168,53 @@ fn cmd_sign(args: &[String]) -> ExitCode {
     }
 }
 
-fn cmd_verify(args: &[String]) -> ExitCode {
-    if args.len() < 3 {
-        eprintln!("verify: need <signed.pdf>");
-        return ExitCode::from(2);
-    }
-    match verify_pdf_file(&args[2]) {
-        Ok(report) => {
-            if report.signatures.is_empty() {
-                println!("no signatures found");
+fn run_verify(a: VerifyArgs) -> ExitCode {
+    let report = if let Some(roots_path) = &a.roots {
+        let pem = match std::fs::read(roots_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: reading roots: {e}");
                 return ExitCode::FAILURE;
             }
-            for (i, s) in report.signatures.iter().enumerate() {
-                println!("signature #{}:", i + 1);
-                println!("  valid:                 {}", s.valid);
-                println!("  signer:                {}", s.signer.as_deref().unwrap_or("-"));
-                println!("  byte_range:            {:?}", s.byte_range);
-                println!("  signed_len:            {} bytes", s.signed_len);
-                println!("  covers_whole_document: {}", s.covers_whole_document);
-                println!("  detail:                {}", s.detail);
-            }
-            if report.all_valid() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
+        };
+        match TrustStore::from_pem(&pem) {
+            Ok(store) => verify_pdf_file_with_roots(&a.input, &store),
+            Err(e) => {
+                eprintln!("error: parsing roots: {e}");
+                return ExitCode::FAILURE;
             }
         }
+    } else {
+        verify_pdf_file(&a.input)
+    };
+
+    let report = match report {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+
+    if report.signatures.is_empty() {
+        println!("no signatures found");
+        return ExitCode::FAILURE;
+    }
+    for (i, s) in report.signatures.iter().enumerate() {
+        println!("signature #{}:", i + 1);
+        println!("  valid:                 {}", s.valid);
+        println!("  signer:                {}", s.signer.as_deref().unwrap_or("-"));
+        println!(
+            "  chain_trusted:         {}",
+            s.chain_trusted.map_or("n/a (no roots)".into(), |b| b.to_string())
+        );
+        println!("  covers_whole_document: {}", s.covers_whole_document);
+        println!("  detail:                {}", s.detail);
+    }
+
+    if report.all_valid() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

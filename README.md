@@ -20,17 +20,23 @@ opens as valid in Adobe Reader.
 
 ```console
 $ cargo run --example gen_assets        # writes sample.pdf + keystore.p12
-$ cargo run -- sign sample.pdf signed.pdf keystore.p12 password "Approved"
-$ cargo run -- verify signed.pdf
+$ pdf_signer sign sample.pdf signed.pdf keystore.p12 \
+      --password password --reason "Approved" --level blta \
+      --tsa-url http://timestamp.digicert.com \
+      --text "Digitally signed" --image logo.png --font Arial.ttf
+$ pdf_signer verify signed.pdf --roots icp-brasil-roots.pem
 signature #1:
   valid:                 true
-  signer:                CN=pdf_signer PoC,O=StrategicProjects,C=BR
+  signer:                CN=...
+  chain_trusted:         true
   detail:                valid CMS signature; signer: ...
 $ pdfsig signed.pdf
   - Signature Type: ETSI.CAdES.detached
   - Signature Validation: Signature is Valid.
   - Total document signed
 ```
+
+Run `pdf_signer sign --help` / `verify --help` for all options.
 
 ## Features
 

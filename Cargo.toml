@@ -23,6 +23,8 @@ flate2 = "1"
 # Richer visible appearances: embedded TrueType fonts and PNG/JPEG logos.
 ttf-parser = "0.25"
 png = "0.18"
+# CLI argument parsing (used only by the `pdf_signer` binary).
+clap = { version = "4", features = ["derive", "env"] }
 
 # Pure-Rust crypto stack (no OpenSSL / system libs) for a vendorable CRAN build.
 # x509-cert is pulled in transitively by cms; we use its `builder` for testkit.
