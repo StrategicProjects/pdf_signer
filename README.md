@@ -73,6 +73,72 @@ Run `pdf_signer sign --help` / `verify --help` for all options.
 | **B-LT**   | + `/DSS` (certificate chain + CRLs)                | `Blt`         | yes         |
 | **B-LTA**  | + `/DocTimeStamp` over the whole file              | `Blta`        | yes         |
 
+## Command-line interface
+
+The crate ships a `pdf_signer` binary with two subcommands. Install it (or run
+it straight from a checkout):
+
+```console
+$ cargo install --path .            # puts `pdf_signer` on your PATH
+# …or, without installing:
+$ cargo run --release -- sign  …    # everything after `--` is forwarded
+$ cargo run --release -- verify …
+```
+
+### `sign`
+
+```console
+$ pdf_signer sign <INPUT> <OUTPUT> <KEYSTORE> --password <PWD> [options]
+```
+
+| Argument / flag | Meaning |
+| --- | --- |
+| `<INPUT>` `<OUTPUT>` `<KEYSTORE>` | input PDF, signed output PDF, PKCS#12 `.p12`/`.pfx` |
+| `-p, --password` | keystore password (or set `KEY_PASSWORD` in the environment) |
+| `--level <bb\|bt\|blt\|blta>` | PAdES level (default `bb`); `bt`+ need `--tsa-url` |
+| `--tsa-url <URL>` | RFC 3161 timestamp authority (`http://`, or `https://` with the `https` feature) |
+| `--reason` / `--name` / `--location` | signature dictionary metadata |
+| `--text <STR>` | draw a **visible** signature box with this text |
+| `--page --x --y --width --height --font-size` | box placement/size, in points |
+| `--no-border` | omit the box border |
+| `--font <FILE.ttf>` | embed a TrueType/OpenType font in the box |
+| `--image <FILE.png\|jpg>` | draw a PNG/JPEG logo in the box |
+
+```console
+# Invisible PAdES-B-B signature, password from the environment:
+$ KEY_PASSWORD=secret pdf_signer sign in.pdf out.pdf keystore.p12
+
+# Visible box, long-term (B-LTA) with a timestamp and an embedded logo:
+$ pdf_signer sign in.pdf out.pdf keystore.p12 \
+      --password secret --level blta \
+      --tsa-url http://timestamp.digicert.com \
+      --reason "Approved" --name "André Leite" \
+      --text "Digitally signed" --image logo.png --font Arial.ttf
+```
+
+### `verify`
+
+```console
+$ pdf_signer verify <INPUT> [--roots <ROOTS.pem>]
+```
+
+Without `--roots` it reports cryptographic validity only; pass a PEM bundle of
+trusted roots (e.g. ICP-Brasil) to additionally validate each signer's chain.
+
+```console
+$ pdf_signer verify out.pdf --roots icp-brasil-roots.pem
+signature #1:
+  valid:                 true
+  signer:                CN=…
+  chain_trusted:         true
+  covers_whole_document: true
+  detail:                valid CMS signature; signer: …
+```
+
+The process exits `0` only when at least one signature is present and all found
+signatures are valid. Run `pdf_signer sign --help` / `verify --help` for the
+full, authoritative list of options.
+
 ## Library usage
 
 ```rust
