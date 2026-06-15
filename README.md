@@ -177,6 +177,8 @@ pdf_signer = { version = "0.1", features = ["https"] }
 
 ## How it works
 
+<img src="docs/architecture.svg" alt="pdf_signer architecture: Rust apps, the R package (pdfsigner) and the Python package (pdfsignerpy) consume the crate's public API and CLI, which drive the core modules (sign, verify, trust, policy, dss, tsa, crypto, appearance, incremental) and Rust dependencies to produce PAdES-signed PDFs and verification reports." width="100%" />
+
 1. **PDF structure** (`lopdf`) — add an AcroForm signature field and a `/Sig`
    dictionary with `/SubFilter /ETSI.CAdES.detached`, a `/ByteRange` placeholder
    and a zero-filled `/Contents` placeholder.
