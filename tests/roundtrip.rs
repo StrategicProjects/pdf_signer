@@ -174,6 +174,35 @@ fn pades_bt_over_https_tsa() {
 }
 
 #[test]
+fn timestamped_levels_require_a_tsa_url() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+
+    // B-T / B-LT / B-LTA without a TSA must fail loudly, not silently
+    // downgrade to B-B (issue #1).
+    for level in [PadesLevel::Bt, PadesLevel::Blt, PadesLevel::Blta] {
+        let opts = SignOptions {
+            pades_level: level,
+            tsa_url: None,
+            ..Default::default()
+        };
+        let err = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect_err("must require a TSA");
+        assert!(
+            err.to_string().contains("tsa_url"),
+            "error should mention the missing tsa_url, got: {err}"
+        );
+    }
+
+    // B-B needs no TSA and still signs.
+    let opts = SignOptions {
+        pades_level: PadesLevel::Bb,
+        tsa_url: None,
+        ..Default::default()
+    };
+    assert!(sign_pdf_bytes(&pdf, &p12, "pw", &opts).is_ok());
+}
+
+#[test]
 #[ignore = "requires network access (TSA + CRL fetch)"]
 fn pades_blta_builds_dss_and_document_timestamp() {
     let pdf = sample_pdf();
