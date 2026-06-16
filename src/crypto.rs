@@ -21,7 +21,7 @@ use const_oid::db::rfc8410::ID_ED_25519;
 use const_oid::ObjectIdentifier;
 
 use der::asn1::{BitString, OctetString, SetOfVec, UtcTime};
-use der::{Any, DateTime, Decode, Encode, Sequence};
+use der::{Any, DateTime, Decode, Encode, Reader, Sequence, SliceReader};
 
 use rsa::pkcs8::{DecodePrivateKey, PrivateKeyInfo};
 use sha2::{Sha384, Sha512};
@@ -35,6 +35,18 @@ use x509_cert::time::Time;
 /// id-aa-timeStampToken (RFC 3161), not present in the const-oid database.
 const ID_AA_TIME_STAMP_TOKEN: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
+
+/// id-ct-TSTInfo (RFC 3161) — the eContentType of a timestamp token.
+const ID_CT_TST_INFO: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
+
+/// RFC 3161 `MessageImprint` — the hash algorithm and the hash of the stamped
+/// data, as echoed back inside `TSTInfo`.
+#[derive(Sequence)]
+struct MessageImprint {
+    hash_algorithm: AlgorithmIdentifierOwned,
+    hashed_message: OctetString,
+}
 
 /// `ESSCertIDv2` with the SHA-256 default hash algorithm and `issuerSerial`
 /// omitted (both optional), leaving just the certificate hash.
@@ -371,20 +383,92 @@ pub(crate) fn signer_certificate_and_pool(
     Ok((signer, pool))
 }
 
-/// Lightweight check that a `/DocTimeStamp` `/Contents` is a well-formed RFC
-/// 3161 token whose message imprint is bound to `data` (the document byte
-/// range). Full TSA-signature/chain validation is left for a future B-LT
-/// verifier; this confirms structure + binding.
+/// Verify a `/DocTimeStamp` RFC 3161 token (`token_der`, a CMS `ContentInfo`)
+/// against `data` (the stamped document byte range).
+///
+/// This checks the full chain of trust *within* the token:
+/// 1. the encapsulated content is an RFC 3161 `TSTInfo`;
+/// 2. the TSA's CMS signature over that `TSTInfo` is cryptographically valid
+///    (signed attributes + `messageDigest`), using the certificate embedded in
+///    the token;
+/// 3. the `TSTInfo.messageImprint` binds to `data` under its stated hash.
+///
+/// Not yet covered (tracked separately): validating the TSA certificate chain
+/// against a trust anchor, and `genTime`/policy/nonce semantics. Signers
+/// identified by `SubjectKeyIdentifier` are not supported.
 pub(crate) fn verify_doc_timestamp(token_der: &[u8], data: &[u8]) -> Result<()> {
-    ContentInfo::from_der(token_der).map_err(crypto)?;
-    let imprint = Sha256::digest(data);
-    if token_der.windows(imprint.len()).any(|w| w == imprint.as_slice()) {
-        Ok(())
-    } else {
-        Err(Error::Verification(
+    let ci = ContentInfo::from_der(token_der).map_err(crypto)?;
+    let sd = ci.content.decode_as::<SignedData>().map_err(crypto)?;
+
+    // The encapsulated content must be a TSTInfo; get its DER octets.
+    let tst_der = tst_info_der(&sd)?;
+
+    // 1. The TSA's signature must verify over the TSTInfo (the eContent).
+    let si = sd
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .ok_or_else(|| Error::Verification("timestamp has no SignerInfo".into()))?;
+    verify_signed_attrs(&sd, si, &tst_der)?;
+
+    // 2. The TSTInfo's messageImprint must bind to `data` under its own hash.
+    let imprint = parse_tst_message_imprint(&tst_der)?;
+    let want = digest_data(imprint.hash_algorithm.oid, data)?;
+    if imprint.hashed_message.as_bytes() != want.as_slice() {
+        return Err(Error::Verification(
             "timestamp imprint does not match the document".into(),
-        ))
+        ));
     }
+    Ok(())
+}
+
+/// Return the `messageImprint.hashedMessage` of a timestamp token, used to
+/// confirm a freshly fetched TSA response stamped the imprint we asked for.
+pub(crate) fn tst_message_imprint(token_der: &[u8]) -> Result<Vec<u8>> {
+    let ci = ContentInfo::from_der(token_der).map_err(crypto)?;
+    let sd = ci.content.decode_as::<SignedData>().map_err(crypto)?;
+    let tst_der = tst_info_der(&sd)?;
+    Ok(parse_tst_message_imprint(&tst_der)?
+        .hashed_message
+        .as_bytes()
+        .to_vec())
+}
+
+/// Extract the DER of the encapsulated `TSTInfo` from a timestamp token's
+/// `SignedData`, validating that the eContentType is `id-ct-TSTInfo`.
+fn tst_info_der(sd: &SignedData) -> Result<Vec<u8>> {
+    let eci = &sd.encap_content_info;
+    if eci.econtent_type != ID_CT_TST_INFO {
+        return Err(Error::Verification(
+            "timestamp token does not encapsulate a TSTInfo".into(),
+        ));
+    }
+    let econtent = eci
+        .econtent
+        .as_ref()
+        .ok_or_else(|| Error::Verification("timestamp token has no eContent".into()))?;
+    let octets = econtent.decode_as::<OctetString>().map_err(crypto)?;
+    Ok(octets.as_bytes().to_vec())
+}
+
+/// Parse the `messageImprint` out of a DER-encoded `TSTInfo`, ignoring the
+/// optional trailing fields (accuracy, ordering, nonce, tsa, extensions).
+fn parse_tst_message_imprint(tst_der: &[u8]) -> Result<MessageImprint> {
+    let mut reader = SliceReader::new(tst_der).map_err(crypto)?;
+    let mi = reader
+        .sequence(|r| {
+            let _version: u8 = r.decode()?; // INTEGER v1
+            let _policy: ObjectIdentifier = r.decode()?; // TSAPolicyId
+            let mi: MessageImprint = r.decode()?;
+            // Skip whatever optional fields follow so the SEQUENCE is consumed.
+            while !r.is_finished() {
+                r.tlv_bytes()?;
+            }
+            Ok(mi)
+        })
+        .map_err(crypto)?;
+    Ok(mi)
 }
 
 /// Verify a detached CMS `der` (a ContentInfo) against `data`.
@@ -403,13 +487,30 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
         .next()
         .ok_or_else(|| Error::Verification("no SignerInfo present".into()))?;
 
+    let cert = verify_signed_attrs(&sd, si, data)?;
+    Ok(CmsVerification {
+        signer_subject: cert.tbs_certificate.subject.to_string(),
+    })
+}
+
+/// Verify a `SignerInfo`'s signature over its signed attributes and that its
+/// `messageDigest` attribute equals `H(content)`, returning the signer
+/// certificate. `content` is whatever the signature commits to: the external
+/// byte range for a detached document signature, or the encapsulated `TSTInfo`
+/// for a timestamp token. Does **not** validate the certificate chain / trust.
+fn verify_signed_attrs<'a>(
+    sd: &'a SignedData,
+    si: &SignerInfo,
+    content: &[u8],
+) -> Result<&'a Certificate> {
     let signed_attrs = si
         .signed_attrs
         .as_ref()
         .ok_or_else(|| Error::Verification("signer has no signed attributes".into()))?;
 
-    // 1. messageDigest attribute must equal H(data) for the SignerInfo's digest.
-    let want = digest_data(si.digest_alg.oid, data)?;
+    // 1. messageDigest attribute must equal H(content) under the SignerInfo's
+    //    digest algorithm.
+    let want = digest_data(si.digest_alg.oid, content)?;
     let mut found_digest = None;
     for attr in signed_attrs.iter() {
         if attr.oid == ID_MESSAGE_DIGEST {
@@ -429,22 +530,17 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
     }
 
     // 2. Locate the signer certificate by issuer + serial.
-    let cert = find_signer_cert(&sd, si)?;
+    let cert = find_signer_cert(sd, si)?;
 
-    // 3. Verify the signer's signature over the DER of the signed attributes,
-    //    using RSA or ECDSA according to the certificate's public key.
+    // 3. Verify the signature over the DER of the signed attributes, using the
+    //    algorithm of the certificate's public key.
     let spki = &cert.tbs_certificate.subject_public_key_info;
     let spki_der = spki.to_der().map_err(crypto)?;
     let signed_attrs_der = signed_attrs.to_der().map_err(crypto)?;
     let sig_bytes = si.signature.as_bytes();
 
     let ok = if spki.algorithm.oid == RSA_ENCRYPTION {
-        let pub_key = rsa::RsaPublicKey::from_public_key_der(&spki_der).map_err(crypto)?;
-        let vk = VerifyingKey::<Sha256>::new(pub_key);
-        match Signature::try_from(sig_bytes) {
-            Ok(s) => vk.verify(&signed_attrs_der, &s).is_ok(),
-            Err(_) => false,
-        }
+        rsa_verify(&spki_der, &signed_attrs_der, sig_bytes, si.digest_alg.oid)
     } else if spki.algorithm.oid == ID_EC_PUBLIC_KEY {
         verify_ecdsa_sig(&spki_der, &signed_attrs_der, sig_bytes)
     } else if spki.algorithm.oid == ID_ED_25519 {
@@ -455,10 +551,27 @@ pub(crate) fn cms_verify(der: &[u8], data: &[u8]) -> Result<CmsVerification> {
     if !ok {
         return Err(Error::Verification("signature invalid".into()));
     }
+    Ok(cert)
+}
 
-    Ok(CmsVerification {
-        signer_subject: cert.tbs_certificate.subject.to_string(),
-    })
+/// Verify an RSA PKCS#1 v1.5 signature over `msg`, choosing the hash from the
+/// SignerInfo's digest algorithm (SHA-256/384/512).
+fn rsa_verify(spki_der: &[u8], msg: &[u8], sig: &[u8], digest_oid: ObjectIdentifier) -> bool {
+    let (Ok(pub_key), Ok(s)) = (
+        rsa::RsaPublicKey::from_public_key_der(spki_der),
+        Signature::try_from(sig),
+    ) else {
+        return false;
+    };
+    if digest_oid == ID_SHA_256 {
+        VerifyingKey::<Sha256>::new(pub_key).verify(msg, &s).is_ok()
+    } else if digest_oid == ID_SHA_384 {
+        VerifyingKey::<Sha384>::new(pub_key).verify(msg, &s).is_ok()
+    } else if digest_oid == ID_SHA_512 {
+        VerifyingKey::<Sha512>::new(pub_key).verify(msg, &s).is_ok()
+    } else {
+        false
+    }
 }
 
 /// Hash `data` with the digest named by `oid` (SHA-256/384/512).
@@ -538,4 +651,33 @@ fn find_signer_cert<'a>(
     Err(Error::Verification(
         "signer certificate not found in CMS".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cms_sign, verify_doc_timestamp};
+    use crate::testkit::self_signed_p12;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn doc_timestamp_rejects_a_non_tstinfo_cms() {
+        // A detached CMS signature over `data` embeds SHA-256(data) as its
+        // messageDigest attribute. The old window-search verifier found those
+        // bytes and wrongly accepted it as a document timestamp. It is not an
+        // RFC 3161 TSTInfo, so the hardened verifier must reject it (issue #4).
+        let data = b"the document byte range";
+        let p12 = self_signed_p12("pw");
+        let cms = cms_sign(&p12, "pw", data, None).expect("sign");
+
+        // Sanity: the imprint really is present in the DER (what fooled the old
+        // check), yet verification now fails for lack of a real TSTInfo.
+        let imprint = Sha256::digest(data);
+        assert!(cms.windows(imprint.len()).any(|w| w == imprint.as_slice()));
+        assert!(verify_doc_timestamp(&cms, data).is_err());
+    }
+
+    #[test]
+    fn doc_timestamp_rejects_garbage() {
+        assert!(verify_doc_timestamp(b"not der at all", b"data").is_err());
+    }
 }
