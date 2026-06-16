@@ -229,6 +229,35 @@ fn chain_validates_against_trusted_root() {
 }
 
 #[test]
+fn all_trusted_separates_validity_from_trust() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // Trusted root: valid AND trusted.
+    let store = TrustStore::from_ders([root_der]).expect("store");
+    let report = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert!(report.all_valid());
+    assert!(report.all_trusted(), "{}", report.signatures[0].detail);
+
+    // Untrusted root: cryptographically valid but NOT trusted. This is the
+    // regression guard for issue #2 — `all_valid` must not imply `all_trusted`.
+    let (_, other_root) = ca_signed_p12("pw");
+    let store2 = TrustStore::from_ders([other_root]).expect("store2");
+    let report2 = verify_pdf_bytes_with_roots(&signed, &store2).expect("verify");
+    assert!(report2.all_valid(), "signature is still crypto-valid");
+    assert!(
+        !report2.all_trusted(),
+        "an untrusted chain must not count as trusted"
+    );
+
+    // No trust store: `all_trusted` falls back to validity (no Some(false)).
+    let none = verify_pdf_bytes(&signed).expect("verify");
+    assert!(none.all_valid());
+    assert!(none.all_trusted());
+}
+
+#[test]
 fn chain_validates_through_intermediate_ca() {
     let pdf = sample_pdf();
     let (p12, root_der) = ca_chain3_p12("pw");

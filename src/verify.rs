@@ -81,9 +81,24 @@ pub struct SignatureReport {
 }
 
 impl SignatureReport {
-    /// True if at least one signature was found and all found are valid.
+    /// True if at least one signature was found and all found are
+    /// cryptographically valid. This says **nothing** about trust — a
+    /// self-signed or untrusted signature can still be `all_valid`. When a
+    /// trust store was supplied, use [`all_trusted`](Self::all_trusted).
     pub fn all_valid(&self) -> bool {
         !self.signatures.is_empty() && self.signatures.iter().all(|s| s.valid)
+    }
+
+    /// True if every signature is valid ([`all_valid`](Self::all_valid)) **and**
+    /// none chains to an untrusted root. Use this when a trust store was
+    /// supplied; entries with no trust result (`chain_trusted == None`, e.g.
+    /// document timestamps) are not treated as failures.
+    pub fn all_trusted(&self) -> bool {
+        self.all_valid()
+            && self
+                .signatures
+                .iter()
+                .all(|s| s.chain_trusted != Some(false))
     }
 }
 
