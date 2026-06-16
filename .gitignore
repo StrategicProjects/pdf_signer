@@ -10,3 +10,8 @@ Cargo.lock.bak
 
 # macOS
 .DS_Store
+
+# AI assistant artifacts
+CLAUDE.md
+memory/
+PLAN.md
