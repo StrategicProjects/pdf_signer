@@ -689,3 +689,110 @@ pub fn cross_signed_scenario() -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
 
     (leaf_der, vec![i_a, i_b], root_b_der)
 }
+
+/// Material for exercising authenticated CRL revocation checks.
+pub struct RevocationScenario {
+    /// Leaf certificate (serial 2), signed by `root`.
+    pub leaf_der: Vec<u8>,
+    /// Trusted root CA (serial 1).
+    pub root_der: Vec<u8>,
+    /// A current CRL, signed by the root, listing the leaf as revoked.
+    pub good_crl: Vec<u8>,
+    /// Same contents, but signed by a different key (signature must not verify).
+    pub wrong_key_crl: Vec<u8>,
+    /// Signed by the root and listing the leaf, but already past `nextUpdate`.
+    pub expired_crl: Vec<u8>,
+}
+
+/// Build a root CA, a leaf, and three CRLs (valid / bad-signature / stale) so
+/// tests can assert that only an authenticated, current CRL revokes the leaf.
+pub fn revocation_scenario() -> RevocationScenario {
+    use der::asn1::{BitString, GeneralizedTime};
+    use der::DateTime;
+    use signature::{SignatureEncoding, Signer};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use x509_cert::certificate::Version;
+    use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};
+    use x509_cert::spki::AlgorithmIdentifierOwned;
+
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap();
+
+    let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let root_signing = SigningKey::<Sha256>::new(root_key);
+    let root_name = Name::from_str("CN=Revocation Root,C=BR").unwrap();
+    let root_cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        root_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(root_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap();
+    let root_der = root_cert.to_der().unwrap();
+
+    let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let leaf_signing = SigningKey::<Sha256>::new(leaf_key);
+    let leaf_serial = SerialNumber::from(2u32);
+    let leaf_cert = CertificateBuilder::new(
+        leaf_profile(root_name.clone()),
+        leaf_serial.clone(),
+        validity,
+        Name::from_str("CN=Revocation Leaf,C=BR").unwrap(),
+        SubjectPublicKeyInfoOwned::from_key(leaf_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap();
+    let leaf_der = leaf_cert.to_der().unwrap();
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let time = |secs: u64| {
+        x509_cert::time::Time::GeneralTime(GeneralizedTime::from_date_time(
+            DateTime::from_unix_duration(Duration::from_secs(secs)).unwrap(),
+        ))
+    };
+    let rsa_sha256 = || AlgorithmIdentifierOwned {
+        oid: const_oid::db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION,
+        parameters: None,
+    };
+
+    // Build a CRL revoking the leaf, signed by `signer`, valid in [this, next].
+    let build_crl = |signer: &SigningKey<Sha256>, this: u64, next: u64| -> Vec<u8> {
+        let tbs = TbsCertList {
+            version: Version::V2,
+            signature: rsa_sha256(),
+            issuer: root_name.clone(),
+            this_update: time(this),
+            next_update: Some(time(next)),
+            revoked_certificates: Some(vec![RevokedCert {
+                serial_number: leaf_serial.clone(),
+                revocation_date: time(this),
+                crl_entry_extensions: None,
+            }]),
+            crl_extensions: None,
+        };
+        let tbs_der = tbs.to_der().unwrap();
+        let sig = signer.sign(&tbs_der);
+        let crl = CertificateList {
+            tbs_cert_list: tbs,
+            signature_algorithm: rsa_sha256(),
+            signature: BitString::from_bytes(&sig.to_vec()).unwrap(),
+        };
+        crl.to_der().unwrap()
+    };
+
+    let wrong_key = SigningKey::<Sha256>::new(RsaPrivateKey::new(&mut rng, 2048).unwrap());
+
+    RevocationScenario {
+        leaf_der,
+        root_der,
+        good_crl: build_crl(&root_signing, now - 3600, now + 3600),
+        wrong_key_crl: build_crl(&wrong_key, now - 3600, now + 3600),
+        expired_crl: build_crl(&root_signing, now - 7200, now - 3600),
+    }
+}
