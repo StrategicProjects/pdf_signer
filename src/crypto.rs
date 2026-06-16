@@ -20,7 +20,7 @@ use const_oid::db::rfc5912::{
 use const_oid::db::rfc8410::ID_ED_25519;
 use const_oid::ObjectIdentifier;
 
-use der::asn1::{BitString, OctetString, SetOfVec, UtcTime};
+use der::asn1::{BitString, GeneralizedTime, OctetString, SetOfVec, UtcTime};
 use der::{Any, DateTime, Decode, Encode, Reader, Sequence, SliceReader};
 
 use rsa::pkcs8::{DecodePrivateKey, PrivateKeyInfo};
@@ -413,7 +413,7 @@ pub(crate) fn verify_doc_timestamp(token_der: &[u8], data: &[u8]) -> Result<()> 
     verify_signed_attrs(&sd, si, &tst_der)?;
 
     // 2. The TSTInfo's messageImprint must bind to `data` under its own hash.
-    let imprint = parse_tst_message_imprint(&tst_der)?;
+    let imprint = parse_tst_info(&tst_der)?.imprint;
     let want = digest_data(imprint.hash_algorithm.oid, data)?;
     if imprint.hashed_message.as_bytes() != want.as_slice() {
         return Err(Error::Verification(
@@ -429,10 +429,68 @@ pub(crate) fn tst_message_imprint(token_der: &[u8]) -> Result<Vec<u8>> {
     let ci = ContentInfo::from_der(token_der).map_err(crypto)?;
     let sd = ci.content.decode_as::<SignedData>().map_err(crypto)?;
     let tst_der = tst_info_der(&sd)?;
-    Ok(parse_tst_message_imprint(&tst_der)?
+    Ok(parse_tst_info(&tst_der)?
+        .imprint
         .hashed_message
         .as_bytes()
         .to_vec())
+}
+
+/// Best trusted time at which to validate the signer's certificate chain.
+///
+/// For PAdES-B-T and above the chain must be judged at signing time, not at
+/// "now" — otherwise a signature that was valid when made starts failing once
+/// the certificate expires. We prefer, in order:
+/// 1. the `genTime` of the signature's embedded RFC 3161 timestamp token;
+/// 2. the `signingTime` signed attribute;
+/// 3. `None` — the caller falls back to the current time (plain B-B).
+///
+/// The embedded timestamp's own signature is not re-verified here; this only
+/// selects a reference instant. A forged time only ever moves validation
+/// earlier/later, and the timestamp token is itself validated elsewhere.
+pub(crate) fn cms_trusted_time(cms_der: &[u8]) -> Option<SystemTime> {
+    let ci = ContentInfo::from_der(cms_der).ok()?;
+    let sd = ci.content.decode_as::<SignedData>().ok()?;
+    let si = sd.signer_infos.0.iter().next()?;
+
+    if let Some(unsigned) = &si.unsigned_attrs {
+        for attr in unsigned.iter() {
+            if attr.oid == ID_AA_TIME_STAMP_TOKEN {
+                if let Some(token_der) = attr.values.iter().next().and_then(|v| v.to_der().ok()) {
+                    if let Ok(t) = token_gen_time(&token_der) {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(signed) = &si.signed_attrs {
+        for attr in signed.iter() {
+            if attr.oid == ID_SIGNING_TIME {
+                // signingTime is a `Time` CHOICE (UTCTime / GeneralizedTime);
+                // decode it from the attribute value's DER.
+                if let Some(t) = attr
+                    .values
+                    .iter()
+                    .next()
+                    .and_then(|v| v.to_der().ok())
+                    .and_then(|der| Time::from_der(&der).ok())
+                {
+                    return Some(t.to_system_time());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `genTime` of a timestamp token (`ContentInfo`), as a `SystemTime`.
+fn token_gen_time(token_der: &[u8]) -> Result<SystemTime> {
+    let ci = ContentInfo::from_der(token_der).map_err(crypto)?;
+    let sd = ci.content.decode_as::<SignedData>().map_err(crypto)?;
+    let tst_der = tst_info_der(&sd)?;
+    Ok(parse_tst_info(&tst_der)?.gen_time.to_system_time())
 }
 
 /// Extract the DER of the encapsulated `TSTInfo` from a timestamp token's
@@ -452,23 +510,31 @@ fn tst_info_der(sd: &SignedData) -> Result<Vec<u8>> {
     Ok(octets.as_bytes().to_vec())
 }
 
-/// Parse the `messageImprint` out of a DER-encoded `TSTInfo`, ignoring the
-/// optional trailing fields (accuracy, ordering, nonce, tsa, extensions).
-fn parse_tst_message_imprint(tst_der: &[u8]) -> Result<MessageImprint> {
+/// The fields of an RFC 3161 `TSTInfo` that we consume.
+struct TstInfo {
+    imprint: MessageImprint,
+    gen_time: GeneralizedTime,
+}
+
+/// Parse the leading fields of a DER-encoded `TSTInfo` (up to `genTime`),
+/// skipping the serialNumber and the optional trailing fields (accuracy,
+/// ordering, nonce, tsa, extensions).
+fn parse_tst_info(tst_der: &[u8]) -> Result<TstInfo> {
     let mut reader = SliceReader::new(tst_der).map_err(crypto)?;
-    let mi = reader
+    reader
         .sequence(|r| {
             let _version: u8 = r.decode()?; // INTEGER v1
             let _policy: ObjectIdentifier = r.decode()?; // TSAPolicyId
-            let mi: MessageImprint = r.decode()?;
+            let imprint: MessageImprint = r.decode()?;
+            r.tlv_bytes()?; // serialNumber (INTEGER), unused
+            let gen_time: GeneralizedTime = r.decode()?;
             // Skip whatever optional fields follow so the SEQUENCE is consumed.
             while !r.is_finished() {
                 r.tlv_bytes()?;
             }
-            Ok(mi)
+            Ok(TstInfo { imprint, gen_time })
         })
-        .map_err(crypto)?;
-    Ok(mi)
+        .map_err(crypto)
 }
 
 /// Verify a detached CMS `der` (a ContentInfo) against `data`.
@@ -679,5 +745,25 @@ mod tests {
     #[test]
     fn doc_timestamp_rejects_garbage() {
         assert!(verify_doc_timestamp(b"not der at all", b"data").is_err());
+    }
+
+    #[test]
+    fn trusted_time_reads_the_signing_time_attribute() {
+        // With no embedded RFC 3161 timestamp, the chain-validation reference
+        // time comes from the signingTime signed attribute, which the signer
+        // stamps as "now" (issue #6). It must parse to roughly the present.
+        use super::cms_trusted_time;
+        use std::time::SystemTime;
+
+        let p12 = self_signed_p12("pw");
+        let cms = cms_sign(&p12, "pw", b"the byte range", None).expect("sign");
+        let at = cms_trusted_time(&cms).expect("signingTime present");
+
+        let now = SystemTime::now();
+        let skew = now
+            .duration_since(at)
+            .or_else(|_| at.duration_since(now))
+            .expect("comparable");
+        assert!(skew.as_secs() < 600, "signingTime should be close to now");
     }
 }

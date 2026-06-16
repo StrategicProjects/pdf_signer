@@ -9,7 +9,7 @@ use x509_cert::crl::CertificateList;
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, OcspResponse};
 
-use crate::crypto::{cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
+use crate::crypto::{cms_trusted_time, cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
 use crate::error::Error;
 use crate::trust::{verify_chain, TrustStore};
 use crate::util::{der_total_len, find_sub, hex_decode};
@@ -189,7 +189,11 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
         if let Ok((leaf, pool)) = signer_certificate_and_pool(&der) {
             let crls = parse_crls(&crate::dss::extract_dss_crls(pdf));
             let ocsps = parse_ocsps(&crate::dss::extract_dss_ocsps(pdf));
-            let result = verify_chain(&leaf, &pool, roots, &crls, &ocsps, SystemTime::now());
+            // PAdES: judge the chain at signing time (the embedded timestamp's
+            // genTime, else the signingTime attribute), not "now", so a
+            // signature stays valid after the certificate expires.
+            let at = cms_trusted_time(&der).unwrap_or_else(SystemTime::now);
+            let result = verify_chain(&leaf, &pool, roots, &crls, &ocsps, at);
             chain_trusted = Some(result.trusted);
             detail = format!("{detail}; chain: {}", result.detail);
         } else {
