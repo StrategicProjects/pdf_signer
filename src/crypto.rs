@@ -436,61 +436,84 @@ pub(crate) fn tst_message_imprint(token_der: &[u8]) -> Result<Vec<u8>> {
         .to_vec())
 }
 
-/// Best trusted time at which to validate the signer's certificate chain.
-///
-/// For PAdES-B-T and above the chain must be judged at signing time, not at
-/// "now" — otherwise a signature that was valid when made starts failing once
-/// the certificate expires. We prefer, in order:
-/// 1. the `genTime` of the signature's embedded RFC 3161 timestamp token;
-/// 2. the `signingTime` signed attribute;
-/// 3. `None` — the caller falls back to the current time (plain B-B).
-///
-/// The embedded timestamp's own signature is not re-verified here; this only
-/// selects a reference instant. A forged time only ever moves validation
-/// earlier/later, and the timestamp token is itself validated elsewhere.
-pub(crate) fn cms_trusted_time(cms_der: &[u8]) -> Option<SystemTime> {
-    let ci = ContentInfo::from_der(cms_der).ok()?;
-    let sd = ci.content.decode_as::<SignedData>().ok()?;
-    let si = sd.signer_infos.0.iter().next()?;
-
-    if let Some(unsigned) = &si.unsigned_attrs {
-        for attr in unsigned.iter() {
-            if attr.oid == ID_AA_TIME_STAMP_TOKEN {
-                if let Some(token_der) = attr.values.iter().next().and_then(|v| v.to_der().ok()) {
-                    if let Ok(t) = token_gen_time(&token_der) {
-                        return Some(t);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(signed) = &si.signed_attrs {
-        for attr in signed.iter() {
-            if attr.oid == ID_SIGNING_TIME {
-                // signingTime is a `Time` CHOICE (UTCTime / GeneralizedTime);
-                // decode it from the attribute value's DER.
-                if let Some(t) = attr
-                    .values
-                    .iter()
-                    .next()
-                    .and_then(|v| v.to_der().ok())
-                    .and_then(|der| Time::from_der(&der).ok())
-                {
-                    return Some(t.to_system_time());
-                }
-            }
-        }
-    }
-    None
+/// A cryptographically verified RFC 3161 signature-timestamp: the asserted
+/// time plus the TSA's own certificates, so the caller can anchor the TSA to a
+/// trust store before relying on `gen_time`.
+pub(crate) struct VerifiedTimestamp {
+    /// The TSA's asserted `genTime`.
+    pub gen_time: SystemTime,
+    /// The TSA's signing certificate.
+    pub tsa_leaf: Certificate,
+    /// Certificates embedded in the token (for building the TSA's chain).
+    pub tsa_pool: Vec<Certificate>,
 }
 
-/// The `genTime` of a timestamp token (`ContentInfo`), as a `SystemTime`.
-fn token_gen_time(token_der: &[u8]) -> Result<SystemTime> {
-    let ci = ContentInfo::from_der(token_der).map_err(crypto)?;
+/// Verify the embedded RFC 3161 **signature-timestamp** of a document CMS.
+///
+/// This authenticates the time before it can be used as a validation anchor:
+/// it checks the TSA's CMS signature over the `TSTInfo`, and that the token's
+/// `messageImprint` equals the hash of the document signer's signature value
+/// (RFC 3161 / CAdES signature-timestamp semantics). It returns the `genTime`
+/// together with the TSA's certificates so the caller can require the TSA to
+/// chain to a trusted root — without that anchor a forged self-issued TSA could
+/// assert any time. The unauthenticated `signingTime` attribute is deliberately
+/// **not** consulted; it is display-only.
+pub(crate) fn verify_embedded_timestamp(cms_der: &[u8]) -> Result<VerifiedTimestamp> {
+    let ci = ContentInfo::from_der(cms_der).map_err(crypto)?;
     let sd = ci.content.decode_as::<SignedData>().map_err(crypto)?;
-    let tst_der = tst_info_der(&sd)?;
-    Ok(parse_tst_info(&tst_der)?.gen_time.to_system_time())
+    let si = sd
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .ok_or_else(|| Error::Verification("no SignerInfo present".into()))?;
+    let signature_value = si.signature.as_bytes();
+
+    // Locate the id-aa-timeStampToken unsigned attribute.
+    let token_der = si
+        .unsigned_attrs
+        .as_ref()
+        .and_then(|attrs| attrs.iter().find(|a| a.oid == ID_AA_TIME_STAMP_TOKEN))
+        .and_then(|a| a.values.iter().next())
+        .ok_or_else(|| Error::Verification("no signature timestamp present".into()))?
+        .to_der()
+        .map_err(crypto)?;
+
+    // Verify the TSA's signature over its TSTInfo (the eContent).
+    let tci = ContentInfo::from_der(&token_der).map_err(crypto)?;
+    let tsd = tci.content.decode_as::<SignedData>().map_err(crypto)?;
+    let tst_der = tst_info_der(&tsd)?;
+    let tsi = tsd
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .ok_or_else(|| Error::Verification("timestamp has no SignerInfo".into()))?;
+    let tsa_leaf = verify_signed_attrs(&tsd, tsi, &tst_der)?.clone();
+
+    // The timestamp must imprint the document signer's signature value.
+    let info = parse_tst_info(&tst_der)?;
+    let want = digest_data(info.imprint.hash_algorithm.oid, signature_value)?;
+    if info.imprint.hashed_message.as_bytes() != want.as_slice() {
+        return Err(Error::Verification(
+            "signature timestamp does not bind to the signature".into(),
+        ));
+    }
+
+    let mut tsa_pool = Vec::new();
+    if let Some(set) = &tsd.certificates {
+        for choice in set.0.iter() {
+            if let CertificateChoices::Certificate(c) = choice {
+                tsa_pool.push(c.clone());
+            }
+        }
+    }
+
+    Ok(VerifiedTimestamp {
+        gen_time: info.gen_time.to_system_time(),
+        tsa_leaf,
+        tsa_pool,
+    })
 }
 
 /// Extract the DER of the encapsulated `TSTInfo` from a timestamp token's
@@ -748,22 +771,18 @@ mod tests {
     }
 
     #[test]
-    fn trusted_time_reads_the_signing_time_attribute() {
-        // With no embedded RFC 3161 timestamp, the chain-validation reference
-        // time comes from the signingTime signed attribute, which the signer
-        // stamps as "now" (issue #6). It must parse to roughly the present.
-        use super::cms_trusted_time;
-        use std::time::SystemTime;
+    fn embedded_timestamp_required_for_trusted_time() {
+        // A B-B signature carries no RFC 3161 signature-timestamp, so there is
+        // no authenticated time anchor: the chain must be judged at "now", never
+        // at the signer-asserted signingTime (issue #6 / security review). The
+        // verifier surfaces this as an error so the caller falls back to now().
+        use super::verify_embedded_timestamp;
 
         let p12 = self_signed_p12("pw");
         let cms = cms_sign(&p12, "pw", b"the byte range", None).expect("sign");
-        let at = cms_trusted_time(&cms).expect("signingTime present");
-
-        let now = SystemTime::now();
-        let skew = now
-            .duration_since(at)
-            .or_else(|_| at.duration_since(now))
-            .expect("comparable");
-        assert!(skew.as_secs() < 600, "signingTime should be close to now");
+        assert!(
+            verify_embedded_timestamp(&cms).is_err(),
+            "no embedded timestamp must not yield a trusted time"
+        );
     }
 }

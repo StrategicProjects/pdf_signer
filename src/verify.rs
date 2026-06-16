@@ -9,7 +9,9 @@ use x509_cert::crl::CertificateList;
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, OcspResponse};
 
-use crate::crypto::{cms_trusted_time, cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
+use crate::crypto::{
+    cms_verify, signer_certificate_and_pool, verify_doc_timestamp, verify_embedded_timestamp,
+};
 use crate::error::Error;
 use crate::trust::{verify_chain, TrustStore};
 use crate::util::{der_total_len, find_sub, hex_decode};
@@ -189,10 +191,14 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
         if let Ok((leaf, pool)) = signer_certificate_and_pool(&der) {
             let crls = parse_crls(&crate::dss::extract_dss_crls(pdf));
             let ocsps = parse_ocsps(&crate::dss::extract_dss_ocsps(pdf));
-            // PAdES: judge the chain at signing time (the embedded timestamp's
-            // genTime, else the signingTime attribute), not "now", so a
-            // signature stays valid after the certificate expires.
-            let at = cms_trusted_time(&der).unwrap_or_else(SystemTime::now);
+            // PAdES: judge the chain at signing time so a signature stays valid
+            // after the certificate expires — but only when that time comes from
+            // a trustworthy source. A `genTime` is used only if its RFC 3161
+            // token verifies AND the TSA itself chains to a trusted root;
+            // otherwise we fall back to "now". The signer-asserted `signingTime`
+            // is never used (it would let an expired/revoked cert backdate
+            // itself past expiry/revocation checks).
+            let at = trusted_time(&der, roots, &crls, &ocsps).unwrap_or_else(SystemTime::now);
             let result = verify_chain(&leaf, &pool, roots, &crls, &ocsps, at);
             chain_trusted = Some(result.trusted);
             detail = format!("{detail}; chain: {}", result.detail);
@@ -210,6 +216,24 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
         chain_trusted,
         detail,
     })
+}
+
+/// The reference instant for validating the signer chain: the `genTime` of the
+/// signature's embedded RFC 3161 timestamp, but only when that token verifies
+/// cryptographically *and* the TSA's own certificate chains to a trusted root.
+/// Returns `None` otherwise, so the caller validates at the current time.
+fn trusted_time(
+    der: &[u8],
+    roots: &TrustStore,
+    crls: &[CertificateList],
+    ocsps: &[BasicOcspResponse],
+) -> Option<SystemTime> {
+    let ts = verify_embedded_timestamp(der).ok()?;
+    // The TSA must itself be trusted (validated at the present time), else a
+    // self-issued TSA could assert any genTime to dodge expiry/revocation.
+    verify_chain(&ts.tsa_leaf, &ts.tsa_pool, roots, crls, ocsps, SystemTime::now())
+        .trusted
+        .then_some(ts.gen_time)
 }
 
 /// Read the `/SubFilter` name that precedes the `/ByteRange` at `br` (each
