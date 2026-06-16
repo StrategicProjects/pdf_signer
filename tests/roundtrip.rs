@@ -12,6 +12,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 #[test]
 fn sign_then_verify_roundtrip() {
     let pdf = sample_pdf();
@@ -37,6 +41,48 @@ fn sign_then_verify_roundtrip() {
     assert!(s.valid, "signature must verify: {}", s.detail);
     assert!(s.covers_whole_document, "byte range must cover whole doc");
     assert!(report.all_valid());
+}
+
+#[test]
+fn coverage_requires_byterange_to_match_contents() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let mut signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // Untampered: the ByteRange gap is exactly the /Contents hex string.
+    let report = verify_pdf_bytes(&signed).expect("verify");
+    assert!(
+        report.signatures[0].covers_whole_document,
+        "a normal signature must cover the whole document"
+    );
+
+    // Tamper *only* the /ByteRange numbers: shrink the first segment by 4 bytes
+    // so the excluded gap now starts before the real `/Contents` `<`, leaving 4
+    // bytes outside the signature that are NOT the Contents string. The byte
+    // span 0..EOF is still spanned, so this exercises the new binding check
+    // (issue #3), not the old start/end check.
+    let open = find(&signed, b"/ByteRange").expect("ByteRange");
+    let lb = open + find(&signed[open..], b"[").expect("[");
+    let rb = lb + find(&signed[lb..], b"]").expect("]");
+    let span = rb - lb + 1;
+    let nums: Vec<i64> = std::str::from_utf8(&signed[lb + 1..rb])
+        .unwrap()
+        .split_whitespace()
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(nums.len(), 4);
+    let mut repl = format!("[{} {} {} {}]", nums[0], nums[1] - 4, nums[2], nums[3]).into_bytes();
+    assert!(repl.len() <= span);
+    while repl.len() < span {
+        repl.insert(repl.len() - 1, b' ');
+    }
+    signed[lb..=rb].copy_from_slice(&repl);
+
+    let report2 = verify_pdf_bytes(&signed).expect("verify");
+    assert!(
+        !report2.signatures[0].covers_whole_document,
+        "a ByteRange gap that does not match /Contents must not claim whole-document coverage"
+    );
 }
 
 #[test]
