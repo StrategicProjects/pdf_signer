@@ -130,63 +130,87 @@ pub(crate) fn verify_chain(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // 1. Build the ordered path [leaf, intermediate..., root] with per-link
-    //    checks (signature, validity, revocation, CA constraints).
+    // Build [leaf, intermediate..., root] depth-first, backtracking past any
+    // candidate issuer that fails its checks so a valid alternative chain — e.g.
+    // under cross-signing, duplicate intermediates, or a candidate that trips a
+    // constraint — can still be found rather than abandoned.
     let mut path: Vec<Certificate> = vec![leaf.clone()];
-    let mut intermediates = 0usize;
-    loop {
-        let current = path.last().unwrap().clone();
-        if !valid_at(&current, at) {
-            return fail("a certificate in the path is expired or not yet valid");
-        }
-        if is_revoked(&current, crls) {
-            return fail("a certificate in the path has been revoked (CRL)");
-        }
-        // Signer certificate is itself a trusted root.
-        if store.roots.iter().any(|r| same_cert(r, &current)) {
-            return finalize(&path, store, at);
-        }
-        // Directly issued by a trusted root.
-        if let Some(root) = store.roots.iter().find(|r| issued_by(&current, r)) {
-            if ocsp_revoked(&current, root, ocsps) {
-                return fail("a certificate in the path has been revoked (OCSP)");
-            }
-            if !valid_at(root, at) {
-                return fail("trusted root is expired");
-            }
-            path.push(root.clone());
-            return finalize(&path, store, at);
-        }
-        if path.len() > MAX_DEPTH {
-            return fail("certificate path too long");
-        }
-        // Climb one intermediate; it must be a CA whose pathLenConstraint still
-        // permits the certificates below it, and assert keyCertSign.
-        match pool
-            .iter()
-            .find(|c| !same_cert(c, &current) && issued_by(&current, c))
-        {
-            Some(next) => {
-                match ca_constraints(next) {
-                    Some((true, path_len)) => {
-                        if path_len.is_some_and(|n| (n as usize) < intermediates) {
-                            return fail("intermediate CA pathLenConstraint exceeded");
-                        }
-                    }
-                    _ => return fail("intermediate is not a CA (basicConstraints)"),
-                }
-                if !permits_cert_sign(next) {
-                    return fail("intermediate CA lacks keyCertSign key usage");
-                }
-                if ocsp_revoked(&current, next, ocsps) {
-                    return fail("a certificate in the path has been revoked (OCSP)");
-                }
-                intermediates += 1;
-                path.push(next.clone());
-            }
-            None => return fail("could not build a path to a trusted root"),
-        }
+    extend_path(&mut path, store, pool, crls, ocsps, at, 0)
+}
+
+/// Depth-first certificate-path construction with backtracking. `path` ends at
+/// the certificate we are trying to chain upward to a trusted root. Returns the
+/// first fully validated [`ChainResult`], else a failure. Each candidate issuer
+/// is evaluated independently: a rejected candidate is skipped, not fatal, so a
+/// later valid issuer still gets its turn.
+#[allow(clippy::too_many_arguments)]
+fn extend_path(
+    path: &mut Vec<Certificate>,
+    store: &TrustStore,
+    pool: &[Certificate],
+    crls: &[CertificateList],
+    ocsps: &[BasicOcspResponse],
+    at: i64,
+    intermediates: usize,
+) -> ChainResult {
+    let current = path.last().unwrap().clone();
+    if !valid_at(&current, at) {
+        return fail("a certificate in the path is expired or not yet valid");
     }
+    if is_revoked(&current, crls) {
+        return fail("a certificate in the path has been revoked (CRL)");
+    }
+    // The current certificate is itself a trusted anchor.
+    if store.roots.iter().any(|r| same_cert(r, &current)) {
+        return finalize(path, store, at);
+    }
+    // The most informative rejection seen so far (a path that reached a root but
+    // failed a path-wide check beats the generic "no path" message).
+    let mut pending: Option<ChainResult> = None;
+
+    // Try every trusted root that could have issued `current`.
+    for root in store.roots.iter().filter(|r| issued_by(&current, r)) {
+        if ocsp_revoked(&current, root, ocsps) || !valid_at(root, at) {
+            continue;
+        }
+        path.push(root.clone());
+        let result = finalize(path, store, at);
+        if result.trusted {
+            return result;
+        }
+        pending.get_or_insert(result);
+        path.pop();
+    }
+    if intermediates >= MAX_DEPTH {
+        return pending.unwrap_or_else(|| fail("certificate path too long"));
+    }
+    // Try every candidate intermediate that could have issued `current`.
+    for next in pool.iter() {
+        // Skip self and anything already on the path (avoid cycles).
+        if same_cert(next, &current) || path.iter().any(|c| same_cert(c, next)) {
+            continue;
+        }
+        if !issued_by(&current, next) {
+            continue;
+        }
+        // Must be a CA whose pathLenConstraint still permits the certificates
+        // below it, assert keyCertSign, and not be revoked.
+        match ca_constraints(next) {
+            Some((true, path_len)) if !path_len.is_some_and(|n| (n as usize) < intermediates) => {}
+            _ => continue,
+        }
+        if !permits_cert_sign(next) || ocsp_revoked(&current, next, ocsps) {
+            continue;
+        }
+        path.push(next.clone());
+        let result = extend_path(path, store, pool, crls, ocsps, at, intermediates + 1);
+        if result.trusted {
+            return result;
+        }
+        pending.get_or_insert(result);
+        path.pop();
+    }
+    pending.unwrap_or_else(|| fail("could not build a path to a trusted root"))
 }
 
 /// Run the path-wide checks (name constraints, required policy) once a trusted

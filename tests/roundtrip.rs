@@ -352,6 +352,27 @@ fn chain_validates_through_intermediate_ca() {
 }
 
 #[test]
+fn cross_signed_chain_finds_the_trusted_branch() {
+    use pdf_signer::{testkit::cross_signed_scenario, verify_certificate_chain};
+    use std::time::SystemTime;
+
+    // The intermediate is cross-certified by an untrusted root A and a trusted
+    // root B; the pool lists the untrusted cross-cert first. Path building must
+    // backtrack past it and reach root B (issue #9). A first-match-only builder
+    // would commit to the A branch and fail.
+    let (leaf, pool, trusted_root_b) = cross_signed_scenario();
+    let store = TrustStore::from_ders([trusted_root_b]).expect("store");
+    assert!(
+        verify_certificate_chain(&leaf, &pool, &[], &store, SystemTime::now()),
+        "backtracking must find the trusted cross-signed branch"
+    );
+
+    // Order-independence: same result with the trusted cross-cert listed first.
+    let reversed: Vec<Vec<u8>> = pool.into_iter().rev().collect();
+    assert!(verify_certificate_chain(&leaf, &reversed, &[], &store, SystemTime::now()));
+}
+
+#[test]
 fn ecdsa_p256_sign_and_verify() {
     let pdf = sample_pdf();
     let p12 = self_signed_p256_p12("pw");

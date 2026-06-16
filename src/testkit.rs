@@ -610,3 +610,82 @@ pub fn ca_chain3_p12(password: &str) -> (Vec<u8>, Vec<u8>) {
     ks.add_entry("poc", KeyStoreEntry::PrivateKeyChain(chain));
     (ks.writer(password).write().expect("write p12"), root_der)
 }
+
+/// Build a **cross-signing** scenario for path-building tests.
+///
+/// One intermediate key with subject `CN=Cross Intermediate` is certified twice:
+/// once by an *untrusted* root A and once by a *trusted* root B. A leaf is signed
+/// by the intermediate key. Returns `(leaf_der, pool, trusted_root_b_der)` where
+/// `pool` is `[I_a, I_b]` — the untrusted-chaining cross-cert first, so a
+/// non-backtracking path builder commits to the dead end and fails.
+pub fn cross_signed_scenario() -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap();
+
+    // Two independent roots: A (untrusted) and B (trusted).
+    let make_root = |name: &str, rng: &mut rand::rngs::ThreadRng| {
+        let key = RsaPrivateKey::new(rng, 2048).unwrap();
+        let signing = SigningKey::<Sha256>::new(key);
+        let name = Name::from_str(name).unwrap();
+        let cert = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(1u32),
+            validity,
+            name.clone(),
+            SubjectPublicKeyInfoOwned::from_key(signing.verifying_key()).unwrap(),
+            &signing,
+        )
+        .unwrap()
+        .build::<Signature>()
+        .unwrap();
+        (signing, name, cert.to_der().unwrap())
+    };
+    let (root_a_signing, root_a_name, _root_a_der) = make_root("CN=Cross Root A,C=BR", &mut rng);
+    let (root_b_signing, root_b_name, root_b_der) = make_root("CN=Cross Root B,C=BR", &mut rng);
+
+    // One intermediate key, certified by each root (same subject + key).
+    let inter_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let inter_signing = SigningKey::<Sha256>::new(inter_key.clone());
+    let inter_name = Name::from_str("CN=Cross Intermediate,C=BR").unwrap();
+    let inter_spki = SubjectPublicKeyInfoOwned::from_key(inter_signing.verifying_key()).unwrap();
+
+    let make_inter = |issuer: Name, signer: &SigningKey<Sha256>, spki: &SubjectPublicKeyInfoOwned| {
+        CertificateBuilder::new(
+            Profile::SubCA {
+                issuer,
+                path_len_constraint: Some(0),
+            },
+            SerialNumber::from(2u32),
+            validity,
+            inter_name.clone(),
+            spki.clone(),
+            signer,
+        )
+        .unwrap()
+        .build::<Signature>()
+        .unwrap()
+        .to_der()
+        .unwrap()
+    };
+    let i_a = make_inter(root_a_name, &root_a_signing, &inter_spki);
+    let i_b = make_inter(root_b_name, &root_b_signing, &inter_spki);
+
+    // Leaf signed by the intermediate key.
+    let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let leaf_signing = SigningKey::<Sha256>::new(leaf_key);
+    let leaf_der = CertificateBuilder::new(
+        leaf_profile(inter_name),
+        SerialNumber::from(3u32),
+        validity,
+        Name::from_str("CN=Cross Leaf,C=BR").unwrap(),
+        SubjectPublicKeyInfoOwned::from_key(leaf_signing.verifying_key()).unwrap(),
+        &inter_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap()
+    .to_der()
+    .unwrap();
+
+    (leaf_der, vec![i_a, i_b], root_b_der)
+}
