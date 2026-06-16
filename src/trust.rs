@@ -5,9 +5,15 @@
 //! certificate against the **ICP-Brasil** roots (load them with
 //! [`TrustStore::from_pem`]), but works with any root set.
 //!
-//! Scope: RSA PKCS#1 v1.5 with SHA-256/384/512 (the ICP-Brasil norm). ECDSA and
-//! SHA-1 links are treated as unverifiable. No name-constraint / policy
-//! processing and no revocation checking here (CRLs live in the DSS).
+//! Supported signature algorithms: RSA PKCS#1 v1.5 (SHA-256/384/512), ECDSA
+//! (P-256/P-384) and Ed25519; SHA-1 links are treated as unverifiable. The path
+//! checks basicConstraints/`keyCertSign`, the validity window, RFC 5280 name
+//! constraints (§4.2.1.10) and an optional required-policy OID via the
+//! [`policy`](crate::policy) engine.
+//!
+//! Revocation: CRL and OCSP material (collected into the `/DSS`) is consulted,
+//! but the current checks are deliberately limited — CRL/OCSP signatures,
+//! freshness and scope are not yet validated (tracked in the issue tracker).
 
 use std::time::SystemTime;
 

@@ -169,6 +169,9 @@ fn run_sign(a: SignArgs) -> ExitCode {
 }
 
 fn run_verify(a: VerifyArgs) -> ExitCode {
+    // When a trust store is supplied, the chain must be trusted for success;
+    // otherwise we can only attest to cryptographic validity.
+    let roots_supplied = a.roots.is_some();
     let report = if let Some(roots_path) = &a.roots {
         let pem = match std::fs::read(roots_path) {
             Ok(p) => p,
@@ -212,7 +215,18 @@ fn run_verify(a: VerifyArgs) -> ExitCode {
         println!("  detail:                {}", s.detail);
     }
 
-    if report.all_valid() {
+    if roots_supplied {
+        if report.all_trusted() {
+            ExitCode::SUCCESS
+        } else if report.all_valid() {
+            eprintln!(
+                "error: signature(s) cryptographically valid but not trusted by the supplied roots"
+            );
+            ExitCode::FAILURE
+        } else {
+            ExitCode::FAILURE
+        }
+    } else if report.all_valid() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

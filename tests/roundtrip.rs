@@ -12,6 +12,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 #[test]
 fn sign_then_verify_roundtrip() {
     let pdf = sample_pdf();
@@ -37,6 +41,48 @@ fn sign_then_verify_roundtrip() {
     assert!(s.valid, "signature must verify: {}", s.detail);
     assert!(s.covers_whole_document, "byte range must cover whole doc");
     assert!(report.all_valid());
+}
+
+#[test]
+fn coverage_requires_byterange_to_match_contents() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let mut signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // Untampered: the ByteRange gap is exactly the /Contents hex string.
+    let report = verify_pdf_bytes(&signed).expect("verify");
+    assert!(
+        report.signatures[0].covers_whole_document,
+        "a normal signature must cover the whole document"
+    );
+
+    // Tamper *only* the /ByteRange numbers: shrink the first segment by 4 bytes
+    // so the excluded gap now starts before the real `/Contents` `<`, leaving 4
+    // bytes outside the signature that are NOT the Contents string. The byte
+    // span 0..EOF is still spanned, so this exercises the new binding check
+    // (issue #3), not the old start/end check.
+    let open = find(&signed, b"/ByteRange").expect("ByteRange");
+    let lb = open + find(&signed[open..], b"[").expect("[");
+    let rb = lb + find(&signed[lb..], b"]").expect("]");
+    let span = rb - lb + 1;
+    let nums: Vec<i64> = std::str::from_utf8(&signed[lb + 1..rb])
+        .unwrap()
+        .split_whitespace()
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(nums.len(), 4);
+    let mut repl = format!("[{} {} {} {}]", nums[0], nums[1] - 4, nums[2], nums[3]).into_bytes();
+    assert!(repl.len() <= span);
+    while repl.len() < span {
+        repl.insert(repl.len() - 1, b' ');
+    }
+    signed[lb..=rb].copy_from_slice(&repl);
+
+    let report2 = verify_pdf_bytes(&signed).expect("verify");
+    assert!(
+        !report2.signatures[0].covers_whole_document,
+        "a ByteRange gap that does not match /Contents must not claim whole-document coverage"
+    );
 }
 
 #[test]
@@ -174,6 +220,35 @@ fn pades_bt_over_https_tsa() {
 }
 
 #[test]
+fn timestamped_levels_require_a_tsa_url() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+
+    // B-T / B-LT / B-LTA without a TSA must fail loudly, not silently
+    // downgrade to B-B (issue #1).
+    for level in [PadesLevel::Bt, PadesLevel::Blt, PadesLevel::Blta] {
+        let opts = SignOptions {
+            pades_level: level,
+            tsa_url: None,
+            ..Default::default()
+        };
+        let err = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect_err("must require a TSA");
+        assert!(
+            err.to_string().contains("tsa_url"),
+            "error should mention the missing tsa_url, got: {err}"
+        );
+    }
+
+    // B-B needs no TSA and still signs.
+    let opts = SignOptions {
+        pades_level: PadesLevel::Bb,
+        tsa_url: None,
+        ..Default::default()
+    };
+    assert!(sign_pdf_bytes(&pdf, &p12, "pw", &opts).is_ok());
+}
+
+#[test]
 #[ignore = "requires network access (TSA + CRL fetch)"]
 fn pades_blta_builds_dss_and_document_timestamp() {
     let pdf = sample_pdf();
@@ -226,6 +301,35 @@ fn chain_validates_against_trusted_root() {
     let store2 = TrustStore::from_ders([other_root]).expect("store2");
     let report2 = verify_pdf_bytes_with_roots(&signed, &store2).expect("verify");
     assert_eq!(report2.signatures[0].chain_trusted, Some(false));
+}
+
+#[test]
+fn all_trusted_separates_validity_from_trust() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+
+    // Trusted root: valid AND trusted.
+    let store = TrustStore::from_ders([root_der]).expect("store");
+    let report = verify_pdf_bytes_with_roots(&signed, &store).expect("verify");
+    assert!(report.all_valid());
+    assert!(report.all_trusted(), "{}", report.signatures[0].detail);
+
+    // Untrusted root: cryptographically valid but NOT trusted. This is the
+    // regression guard for issue #2 — `all_valid` must not imply `all_trusted`.
+    let (_, other_root) = ca_signed_p12("pw");
+    let store2 = TrustStore::from_ders([other_root]).expect("store2");
+    let report2 = verify_pdf_bytes_with_roots(&signed, &store2).expect("verify");
+    assert!(report2.all_valid(), "signature is still crypto-valid");
+    assert!(
+        !report2.all_trusted(),
+        "an untrusted chain must not count as trusted"
+    );
+
+    // No trust store: `all_trusted` falls back to validity (no Some(false)).
+    let none = verify_pdf_bytes(&signed).expect("verify");
+    assert!(none.all_valid());
+    assert!(none.all_trusted());
 }
 
 #[test]

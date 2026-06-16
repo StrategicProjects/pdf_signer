@@ -9,7 +9,9 @@ use x509_cert::crl::CertificateList;
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, OcspResponse};
 
-use crate::crypto::{cms_verify, signer_certificate_and_pool, verify_doc_timestamp};
+use crate::crypto::{
+    cms_verify, signer_certificate_and_pool, verify_doc_timestamp, verify_embedded_timestamp,
+};
 use crate::error::Error;
 use crate::trust::{verify_chain, TrustStore};
 use crate::util::{der_total_len, find_sub, hex_decode};
@@ -81,9 +83,24 @@ pub struct SignatureReport {
 }
 
 impl SignatureReport {
-    /// True if at least one signature was found and all found are valid.
+    /// True if at least one signature was found and all found are
+    /// cryptographically valid. This says **nothing** about trust — a
+    /// self-signed or untrusted signature can still be `all_valid`. When a
+    /// trust store was supplied, use [`all_trusted`](Self::all_trusted).
     pub fn all_valid(&self) -> bool {
         !self.signatures.is_empty() && self.signatures.iter().all(|s| s.valid)
+    }
+
+    /// True if every signature is valid ([`all_valid`](Self::all_valid)) **and**
+    /// none chains to an untrusted root. Use this when a trust store was
+    /// supplied; entries with no trust result (`chain_trusted == None`, e.g.
+    /// document timestamps) are not treated as failures.
+    pub fn all_trusted(&self) -> bool {
+        self.all_valid()
+            && self
+                .signatures
+                .iter()
+                .all(|s| s.chain_trusted != Some(false))
     }
 }
 
@@ -134,7 +151,15 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
     signed.extend_from_slice(&pdf[s1..s1 + l1]);
     signed.extend_from_slice(&pdf[s2..s2 + l2]);
 
-    let covers_whole_document = s1 == 0 && (s2 + l2) == pdf.len();
+    // "Covers the whole document" requires not just spanning byte 0 to EOF, but
+    // that the *only* excluded bytes are exactly the `/Contents <...>` hex
+    // string (from `<` to `>` inclusive). Otherwise a ByteRange could leave
+    // arbitrary unsigned bytes in the gap and still claim full coverage.
+    let (c_lt, c_gt) = locate_contents(pdf, br)?;
+    let covers_whole_document = s1 == 0
+        && (s2 + l2) == pdf.len()
+        && (s1 + l1) == c_lt
+        && s2 == c_gt + 1;
 
     // A `/DocTimeStamp` (SubFilter ETSI.RFC3161) holds a bare RFC 3161 token,
     // not a detached document signature — verify it differently.
@@ -166,7 +191,15 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
         if let Ok((leaf, pool)) = signer_certificate_and_pool(&der) {
             let crls = parse_crls(&crate::dss::extract_dss_crls(pdf));
             let ocsps = parse_ocsps(&crate::dss::extract_dss_ocsps(pdf));
-            let result = verify_chain(&leaf, &pool, roots, &crls, &ocsps, SystemTime::now());
+            // PAdES: judge the chain at signing time so a signature stays valid
+            // after the certificate expires — but only when that time comes from
+            // a trustworthy source. A `genTime` is used only if its RFC 3161
+            // token verifies AND the TSA itself chains to a trusted root;
+            // otherwise we fall back to "now". The signer-asserted `signingTime`
+            // is never used (it would let an expired/revoked cert backdate
+            // itself past expiry/revocation checks).
+            let at = trusted_time(&der, roots, &crls, &ocsps).unwrap_or_else(SystemTime::now);
+            let result = verify_chain(&leaf, &pool, roots, &crls, &ocsps, at);
             chain_trusted = Some(result.trusted);
             detail = format!("{detail}; chain: {}", result.detail);
         } else {
@@ -183,6 +216,24 @@ fn verify_one(pdf: &[u8], br: usize, roots: &TrustStore) -> Result<VerifiedSigna
         chain_trusted,
         detail,
     })
+}
+
+/// The reference instant for validating the signer chain: the `genTime` of the
+/// signature's embedded RFC 3161 timestamp, but only when that token verifies
+/// cryptographically *and* the TSA's own certificate chains to a trusted root.
+/// Returns `None` otherwise, so the caller validates at the current time.
+fn trusted_time(
+    der: &[u8],
+    roots: &TrustStore,
+    crls: &[CertificateList],
+    ocsps: &[BasicOcspResponse],
+) -> Option<SystemTime> {
+    let ts = verify_embedded_timestamp(der).ok()?;
+    // The TSA must itself be trusted (validated at the present time), else a
+    // self-issued TSA could assert any genTime to dodge expiry/revocation.
+    verify_chain(&ts.tsa_leaf, &ts.tsa_pool, roots, crls, ocsps, SystemTime::now())
+        .trusted
+        .then_some(ts.gen_time)
 }
 
 /// Read the `/SubFilter` name that precedes the `/ByteRange` at `br` (each
@@ -232,8 +283,9 @@ fn parse_byte_range(s: &[u8]) -> Result<[i64; 4]> {
     Ok([nums[0], nums[1], nums[2], nums[3]])
 }
 
-/// Pull the CMS DER out of the `/Contents <...>` hex string after `/ByteRange`.
-fn extract_cms(pdf: &[u8], byte_range_pos: usize) -> Result<Vec<u8>> {
+/// Locate the `/Contents <...>` hex string following `/ByteRange` at `br`.
+/// Returns the byte offsets of the opening `<` and the closing `>`.
+fn locate_contents(pdf: &[u8], byte_range_pos: usize) -> Result<(usize, usize)> {
     let rel = find_sub(&pdf[byte_range_pos..], b"/Contents")
         .ok_or_else(|| Error::Malformed("/Contents not found".into()))?;
     let from = byte_range_pos + rel;
@@ -241,6 +293,12 @@ fn extract_cms(pdf: &[u8], byte_range_pos: usize) -> Result<Vec<u8>> {
         + find_sub(&pdf[from..], b"<").ok_or_else(|| Error::Malformed("Contents '<' missing".into()))?;
     let gt = lt
         + find_sub(&pdf[lt..], b">").ok_or_else(|| Error::Malformed("Contents '>' missing".into()))?;
+    Ok((lt, gt))
+}
+
+/// Pull the CMS DER out of the `/Contents <...>` hex string after `/ByteRange`.
+fn extract_cms(pdf: &[u8], byte_range_pos: usize) -> Result<Vec<u8>> {
+    let (lt, gt) = locate_contents(pdf, byte_range_pos)?;
     let raw = hex_decode(&pdf[lt + 1..gt])
         .ok_or_else(|| Error::Malformed("Contents not valid hex".into()))?;
     // Slice off the zero padding using the ASN.1 length header.
