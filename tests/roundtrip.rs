@@ -373,6 +373,49 @@ fn cross_signed_chain_finds_the_trusted_branch() {
 }
 
 #[test]
+fn crl_revocation_must_be_authenticated() {
+    use pdf_signer::{testkit::revocation_scenario, verify_certificate_chain};
+    use std::time::SystemTime;
+
+    let s = revocation_scenario();
+    let store = TrustStore::from_ders([s.root_der.clone()]).expect("store");
+    let now = SystemTime::now();
+
+    // No CRL: revocation is soft-fail, so the leaf still validates.
+    assert!(verify_certificate_chain(&s.leaf_der, &[], &[], &store, now));
+
+    // A current CRL signed by the issuing CA revokes the leaf.
+    assert!(
+        !verify_certificate_chain(&s.leaf_der, &[], std::slice::from_ref(&s.good_crl), &store, now),
+        "an authenticated CRL listing the leaf must revoke it"
+    );
+
+    // A CRL with a bad signature is ignored (not trusted as evidence).
+    assert!(
+        verify_certificate_chain(
+            &s.leaf_der,
+            &[],
+            std::slice::from_ref(&s.wrong_key_crl),
+            &store,
+            now
+        ),
+        "a CRL not signed by the CA must be ignored"
+    );
+
+    // A stale CRL (past nextUpdate) is ignored.
+    assert!(
+        verify_certificate_chain(
+            &s.leaf_der,
+            &[],
+            std::slice::from_ref(&s.expired_crl),
+            &store,
+            now
+        ),
+        "an expired CRL must be ignored"
+    );
+}
+
+#[test]
 fn ecdsa_p256_sign_and_verify() {
     let pdf = sample_pdf();
     let p12 = self_signed_p256_p12("pw");
