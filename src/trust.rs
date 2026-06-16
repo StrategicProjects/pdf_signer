@@ -11,9 +11,12 @@
 //! constraints (§4.2.1.10) and an optional required-policy OID via the
 //! [`policy`](crate::policy) engine.
 //!
-//! Revocation: CRL and OCSP material (collected into the `/DSS`) is consulted,
-//! but the current checks are deliberately limited — CRL/OCSP signatures,
-//! freshness and scope are not yet validated (tracked in the issue tracker).
+//! Revocation: CRL and OCSP material (collected into the `/DSS`) is
+//! authenticated before it is acted on — a CRL must be in scope and signed by
+//! the issuing CA and current; an OCSP response must be signed by the issuer or
+//! a delegated `id-kp-OCSPSigning` responder and current. Revocation is
+//! soft-fail (no usable evidence ⇒ not treated as revoked). Not yet covered:
+//! IDP / partitioned CRLs and a hard-fail mode.
 
 use std::time::SystemTime;
 
