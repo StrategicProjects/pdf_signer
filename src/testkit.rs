@@ -78,6 +78,18 @@ pub fn sample_pdf() -> Vec<u8> {
     buf
 }
 
+/// A valid (unsigned) PDF that contains signature-looking syntax
+/// (`/ByteRange ... /Contents <...>`) inside a content stream. Structural
+/// verification must not mistake it for a signature.
+pub fn pdf_with_byterange_decoy() -> Vec<u8> {
+    let mut doc = Document::load_mem(&sample_pdf()).unwrap();
+    let decoy = b"/ByteRange [0 10 20 10] /Contents <30820000>".to_vec();
+    doc.add_object(Stream::new(dictionary! {}, decoy));
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+    buf
+}
+
 /// Build a self-signed **ECDSA P-256** certificate and wrap it in a PKCS#12.
 pub fn self_signed_p256_p12(password: &str) -> Vec<u8> {
     let mut rng = rand::thread_rng();

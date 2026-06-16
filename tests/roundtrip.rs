@@ -44,6 +44,22 @@ fn sign_then_verify_roundtrip() {
 }
 
 #[test]
+fn byterange_in_stream_is_not_a_signature() {
+    use pdf_signer::testkit::pdf_with_byterange_decoy;
+
+    // A `/ByteRange ... /Contents <...>` sitting in a content stream (not a
+    // signature dictionary) must be ignored: structural parsing finds no
+    // signatures, where a raw byte scan would have reported a bogus one (#5).
+    let pdf = pdf_with_byterange_decoy();
+    assert!(contains(&pdf, b"/ByteRange"), "decoy must be present in bytes");
+    let report = verify_pdf_bytes(&pdf).expect("verify");
+    assert!(
+        report.signatures.is_empty(),
+        "a /ByteRange in stream content is not a signature"
+    );
+}
+
+#[test]
 fn coverage_requires_byterange_to_match_contents() {
     let pdf = sample_pdf();
     let p12 = self_signed_p12("pw");
