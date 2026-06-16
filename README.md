@@ -55,14 +55,21 @@ Run `pdf_signer sign --help` / `verify --help` for all options.
 - **Long-term validation material** — a `/DSS` with the full certificate chain,
   CRLs **and OCSP responses** fetched from the certificates' distribution points
   / responders (B-LT).
-- **Verification** — re-derives the signed byte range, checks the message
-  digest and the signer's signature, and reports each signature *and* document
-  timestamp.
+- **Verification** — locates signatures by document **structure** (not raw byte
+  scanning), re-derives the signed byte range, checks the message digest and the
+  signer's signature, binds the `/ByteRange` to the `/Contents`, and reports each
+  signature *and* document timestamp. RFC 3161 **timestamp tokens are validated
+  cryptographically** (TSTInfo, TSA signature, imprint binding).
 - **Certificate-chain validation** against a trust store (e.g. the **ICP-Brasil**
-  roots): per-link signature (RSA, ECDSA P-256/P-384, Ed25519), validity,
-  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, **CRL + OCSP**
-  revocation, **name constraints** (§4.2.1.10), and the full **policy engine**
-  (`valid_policy_tree`, policy mapping) with an optional required-policy set.
+  roots): path building with **backtracking** (cross-signing / multiple
+  intermediates), per-link signature (RSA, ECDSA P-256/P-384, Ed25519), validity,
+  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, **authenticated CRL +
+  OCSP** revocation (signature, freshness and scope checked), **name constraints**
+  (§4.2.1.10), and the full **policy engine** (`valid_policy_tree`, policy
+  mapping) with an optional required-policy set. For PAdES-B-T and above the
+  chain is judged at the **timestamp's `genTime`** (when the timestamp and its
+  TSA are trusted), not at "now", so a signature stays valid after the
+  certificate expires.
 - **RSA, ECDSA and Ed25519** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA
   P-256/SHA-256 and P-384/SHA-384; Ed25519 per RFC 8419), detected automatically
   from the keystore.
@@ -191,8 +198,9 @@ pdf_signer = { version = "0.1", features = ["https"] }
    signed attributes; optionally fetch and embed an RFC 3161 timestamp.
 4. **DSS / DocTimeStamp** (`dss.rs`) — collect the chain + CRLs into a `/DSS`,
    then append a document timestamp over the whole file.
-5. **Verify** (`verify.rs` + `trust.rs`) — validate the CMS and, optionally, the
-   certificate path against a trust store.
+5. **Verify** (`verify.rs` + `trust.rs`) — enumerate signatures from the parsed
+   document structure, validate the CMS (and RFC 3161 timestamp tokens) and,
+   optionally, the certificate path against a trust store.
 
 ## Scope & limitations
 
@@ -206,6 +214,11 @@ pdf_signer = { version = "0.1", features = ["https"] }
   `PKITS_DIR=/path/to/pkits cargo test --test pkits -- --ignored` (the
   revocation/CRL-shape PKITS sections rely on features this crate does not
   claim, so they are not asserted).
+- **Revocation is authenticated but soft-fail**: a CRL or OCSP response is only
+  acted on once it is in scope, signed by the issuing CA / an authorized
+  responder, and current; when no usable evidence is available a certificate is
+  not treated as revoked. IDP / partitioned CRLs and a hard-fail mode are not
+  yet implemented.
 - **Signing keys**: RSA (SHA-256), ECDSA (P-256/P-384) and Ed25519. Most PDF
   readers (e.g. Adobe) do **not** validate Ed25519 PDF signatures yet — this
   crate's own verifier does.
@@ -230,6 +243,9 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] RFC 5280 policy engine (valid_policy_tree, policy mapping) — **NIST PKITS
   validated** (42/42 policy + 38/38 name-constraint tests)
 - [x] Richer visible appearances (embedded TrueType fonts + PNG/JPEG images)
+- [x] Verification hardening — structural signature location, cryptographic
+  RFC 3161 timestamp validation, authenticated CRL/OCSP, path-building
+  backtracking, signing-time chain validation
 
 ## License
 

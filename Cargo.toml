@@ -1,9 +1,9 @@
 [package]
 name = "pdf_signer"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PoC)."
+description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PAdES B-B → B-LTA)."
 license = "GPL-3.0-or-later"
 repository = "https://github.com/StrategicProjects/pdf_signer"
 readme = "README.md"
