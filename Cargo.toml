@@ -15,6 +15,7 @@ crate-type = ["lib"]
 [[bin]]
 name = "pdf_signer"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 lopdf = "0.36"
@@ -24,7 +25,7 @@ flate2 = "1"
 ttf-parser = "0.25"
 png = "0.18"
 # CLI argument parsing (used only by the `pdf_signer` binary).
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 
 # Pure-Rust crypto stack (no OpenSSL / system libs) for a vendorable CRAN build.
 # x509-cert is pulled in transitively by cms; we use its `builder` for testkit.
@@ -55,3 +56,4 @@ ureq = { version = "3", optional = true }
 [features]
 default = []
 https = ["dep:ureq"]
+cli = ["dep:clap"]
