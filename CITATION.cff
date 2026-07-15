@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use pdf_signer, please cite it using this metadata."
 title: "pdf_signer: a pure-Rust engine to digitally sign and verify PDF documents (PAdES B-B → B-LTA)"
 type: software
-version: 0.2.0
+version: 0.2.1
 doi: ZENODO_DOI_HERE
 license: GPL-3.0-or-later
 repository-code: "https://github.com/StrategicProjects/pdf_signer"
