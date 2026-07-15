@@ -1,0 +1,51 @@
+{
+  "title": "pdf_signer: a pure-Rust engine to digitally sign and verify PDF documents (PAdES B-B → B-LTA)",
+  "description": "<p>pdf_signer is a self-contained Rust library and CLI to digitally sign and verify PDF documents, implementing the PAdES baseline profiles (ETSI EN 319 142) from B-B all the way to B-LTA (CAdES <code>signing-certificate-v2</code>, RFC 3161 signature and document timestamps, and a <code>/DSS</code> with certificate chain, CRLs and OCSP). It supports RSA, ECDSA (P-256/P-384) and Ed25519 keys, performs authenticated CRL and OCSP revocation checking, and ships an RFC 5280 path-validation engine (name constraints and certificate policies with path-building backtracking) validated against the NIST PKITS suite. The cryptography is 100% pure Rust (RustCrypto) — no OpenSSL, no Java, and no system C libraries — so the crate vendors cleanly. It is the engine powering the pdfsigner (R) and pdfsignerpy (Python) bindings.</p>",
+  "upload_type": "software",
+  "language": "eng",
+  "license": "GPL-3.0-or-later",
+  "access_right": "open",
+  "keywords": [
+    "pdf",
+    "digital-signature",
+    "pades",
+    "cades",
+    "pkcs12",
+    "cms",
+    "rfc-3161",
+    "rfc-5280",
+    "timestamp",
+    "ocsp",
+    "crl",
+    "verify",
+    "rust"
+  ],
+  "creators": [
+    {
+      "name": "Leite, André",
+      "affiliation": "Universidade Federal de Pernambuco",
+      "orcid": "0000-0002-4718-9766"
+    },
+    { "name": "Vasconcelos, Hugo", "affiliation": "Universidade Federal de Pernambuco" },
+    { "name": "Bezerra, Diogo", "affiliation": "Universidade Federal de Pernambuco" },
+    { "name": "Wasiliew, Marcos", "affiliation": "Universidade Federal de Pernambuco" },
+    { "name": "Amorim, Carlos", "affiliation": "Universidade Federal de Pernambuco" }
+  ],
+  "related_identifiers": [
+    {
+      "relation": "isSupplementTo",
+      "identifier": "https://github.com/StrategicProjects/pdf_signer",
+      "scheme": "url"
+    },
+    {
+      "relation": "isSourceOf",
+      "identifier": "https://github.com/StrategicProjects/pdfsignerpy",
+      "scheme": "url"
+    },
+    {
+      "relation": "isSourceOf",
+      "identifier": "https://github.com/StrategicProjects/pdfsigner",
+      "scheme": "url"
+    }
+  ]
+}

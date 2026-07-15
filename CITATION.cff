@@ -1,0 +1,57 @@
+cff-version: 1.2.0
+message: "If you use pdf_signer, please cite it using this metadata."
+title: "pdf_signer: a pure-Rust engine to digitally sign and verify PDF documents (PAdES B-B → B-LTA)"
+type: software
+version: 0.2.0
+doi: ZENODO_DOI_HERE
+license: GPL-3.0-or-later
+repository-code: "https://github.com/StrategicProjects/pdf_signer"
+url: "https://github.com/StrategicProjects/pdf_signer"
+keywords:
+  - pdf
+  - digital-signature
+  - pades
+  - cades
+  - pkcs12
+  - cms
+  - rfc-3161
+  - rfc-5280
+  - timestamp
+  - ocsp
+  - crl
+  - verify
+  - rust
+identifiers:
+  - type: doi
+    value: ZENODO_DOI_HERE
+    description: "Concept DOI — always resolves to the latest release"
+authors:
+  - given-names: André
+    family-names: Leite
+    email: leite@castlab.org
+    affiliation: Universidade Federal de Pernambuco
+    orcid: "https://orcid.org/0000-0002-4718-9766"
+  - given-names: Hugo
+    family-names: Vasconcelos
+    email: hugo.vasconcelos@ufpe.br
+    affiliation: Universidade Federal de Pernambuco
+  - given-names: Diogo
+    family-names: Bezerra
+    email: diogo.bezerra@ufpe.br
+    affiliation: Universidade Federal de Pernambuco
+  - given-names: Marcos
+    family-names: Wasiliew
+    email: marcos.wasilew@gmail.com
+    affiliation: Universidade Federal de Pernambuco
+  - given-names: Carlos
+    family-names: Amorim
+    email: carlos.agaf@ufpe.br
+    affiliation: Universidade Federal de Pernambuco
+abstract: >-
+  pdf_signer is a self-contained Rust library and CLI to digitally sign and
+  verify PDF documents, implementing the PAdES baseline profiles (ETSI EN 319
+  142) from B-B to B-LTA. It performs RFC 5280 path validation (validated
+  against the NIST PKITS suite) and authenticated CRL/OCSP revocation checking.
+  The cryptography is 100% pure Rust (RustCrypto) — no OpenSSL, no Java, no
+  system C libraries — and it powers the pdfsigner (R) and pdfsignerpy (Python)
+  bindings.
