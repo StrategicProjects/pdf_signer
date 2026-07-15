@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
 [![PAdES](https://img.shields.io/badge/PAdES-B--B%20%E2%86%92%20B--LTA-success.svg)](#pades-levels)
 ![pure Rust](https://img.shields.io/badge/crypto-pure%20RustCrypto-success.svg)
-[![DOI](https://img.shields.io/badge/DOI-ZENODO_DOI_HERE-blue.svg)](https://doi.org/ZENODO_DOI_HERE)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21366481-blue.svg)](https://doi.org/10.5281/zenodo.21366481)
 
 **Also available as:**
 [![R package: pdfsigner](https://img.shields.io/badge/R-pdfsigner-276DC3?logo=r&logoColor=white)](https://github.com/StrategicProjects/pdfsigner)
@@ -251,8 +251,8 @@ pdf_signer = { version = "0.1", features = ["https"] }
 ## How to cite
 
 If you use `pdf_signer` in academic work, please cite it via its
-[Zenodo record](https://doi.org/ZENODO_DOI_HERE). The concept DOI
-[ZENODO_DOI_HERE](https://doi.org/ZENODO_DOI_HERE) always resolves to the latest
+[Zenodo record](https://doi.org/10.5281/zenodo.21366481). The concept DOI
+[10.5281/zenodo.21366481](https://doi.org/10.5281/zenodo.21366481) always resolves to the latest
 release; each version also has its own DOI. GitHub's “Cite this repository”
 reads [`CITATION.cff`](CITATION.cff) for BibTeX/APA.
 
@@ -262,7 +262,7 @@ reads [`CITATION.cff`](CITATION.cff) for BibTeX/APA.
                Wasiliew, Marcos and Amorim, Carlos},
   title     = {{pdf_signer: a pure-Rust engine to digitally sign and verify PDF documents (PAdES B-B → B-LTA)}},
   publisher = {Zenodo},
-  doi       = {ZENODO_DOI_HERE},
+  doi       = {10.5281/zenodo.21366481},
   url       = {https://github.com/StrategicProjects/pdf_signer}
 }
 ```
