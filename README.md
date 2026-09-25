@@ -1,7 +1,7 @@
 # pdf_signer
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.81%2B-orange.svg)](https://www.rust-lang.org)
 [![PAdES](https://img.shields.io/badge/PAdES-B--B%20%E2%86%92%20B--LTA-success.svg)](#pades-levels)
 ![pure Rust](https://img.shields.io/badge/crypto-pure%20RustCrypto-success.svg)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21366481-blue.svg)](https://doi.org/10.5281/zenodo.21366481)
@@ -276,6 +276,23 @@ PDFs, self-signed / CA-issued PKCS#12 keystores, an in-process RFC 3161 TSA).
   timestamp, a signature whose TSA certificate has expired is judged at "now".
 - **RSASSA-PSS** signatures are not supported (reported as invalid, never
   silently accepted); `SubjectKeyIdentifier` signer identifiers likewise.
+
+## Minimum Rust version
+
+The crate's source and direct dependency requirements build with **rustc 1.81**
+(September 2024), which keeps it usable from R/CRAN, where packages must build
+with a toolchain about two years old. The committed `Cargo.lock` resolves
+newer transitive releases for CI; on an old toolchain resolve MSRV-compatible
+versions first:
+
+```sh
+CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo update
+cargo +1.81.0 check --all-features
+```
+
+Crates that raise their MSRV without declaring `rust-version` are the trap
+(`p12-keystore` 0.2.x is edition 2024 and 0.2.1 uses let-chains), which is why
+this crate pins `p12-keystore = "0.1.5"`.
 
 ## Roadmap
 

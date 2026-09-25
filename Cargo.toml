@@ -1,11 +1,14 @@
 [package]
 name = "pdf_signer"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
-# Minimum toolchain for this crate's own source. The committed Cargo.lock resolves
-# newer transitive releases (time 0.3.49, clap 4.6, base64ct 1.8) that need 1.88;
-# downstream builds on older toolchains pin those (e.g. `time = 0.3.45`, MSRV 1.83).
-rust-version = "1.83"
+# CRAN requires Rust packages to build with a toolchain about two years old, so
+# this crate keeps its own source and its direct dependency requirements buildable
+# on rustc 1.81 (verified with `cargo +1.81.0 check --all-features` after an
+# MSRV-aware `cargo update`, see README "Minimum Rust version"). The committed
+# Cargo.lock resolves newer transitive releases for CI; downstream builds on old
+# toolchains resolve with `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`.
+rust-version = "1.81"
 description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PAdES B-B → B-LTA)."
 license = "GPL-3.0-or-later"
 repository = "https://github.com/StrategicProjects/pdf_signer"
@@ -44,7 +47,8 @@ const-oid = { version = "0.9", features = ["db"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 signature = "2"
-p12-keystore = "0.2"
+# 0.2.x is edition 2024 (rustc 1.85+) and 0.2.1 needs 1.88; 0.1.5 has the same API.
+p12-keystore = "0.1.5"
 rand = "0.8"
 # ECDSA chain verification (P-256 / P-384), for ICP-Brasil EC chains.
 p256 = "0.13"
