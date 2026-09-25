@@ -1,5 +1,8 @@
 # pdf_signer
 
+[![crates.io](https://img.shields.io/crates/v/pdf_signer)](https://crates.io/crates/pdf_signer)
+[![dev version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FStrategicProjects%2Fpdf_signer%2Fmain%2FCargo.toml&query=%24.package.version&label=dev%20version&color=orange)](https://github.com/StrategicProjects/pdf_signer)
+[![docs.rs](https://img.shields.io/docsrs/pdf_signer)](https://docs.rs/pdf_signer)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/rust-1.81%2B-orange.svg)](https://www.rust-lang.org)
 [![PAdES](https://img.shields.io/badge/PAdES-B--B%20%E2%86%92%20B--LTA-success.svg)](#pades-levels)
