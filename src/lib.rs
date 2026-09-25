@@ -11,14 +11,18 @@
 //!   **incremental update**, so any prior signature stays valid. Targets PAdES
 //!   B-B through B-LTA (RFC 3161 signature & document timestamps, `/DSS`).
 //! * [`verify_pdf_file`] / [`verify_pdf_bytes`]: re-extract the signed byte
-//!   range, validate the CMS signature cryptographically, report signer info,
-//!   and optionally validate the signer chain against a [`TrustStore`].
+//!   range, validate the CMS signature cryptographically, check that the
+//!   document was not modified after the last signature
+//!   ([`SignatureReport::document_intact`]), report signer info, and optionally
+//!   validate the signer and TSA chains against a [`TrustStore`].
 //!
 //! ## Notes
 //! * Keys: RSA (PKCS#1 v1.5), ECDSA (P-256/P-384), Ed25519.
 //! * 100% pure Rust (RustCrypto) — no OpenSSL, no Java, no system C libraries.
 //!   An optional `https` feature (ureq/rustls) enables TLS TSA/CRL/OCSP.
 //! * Incremental updates support both classic xref tables and xref streams.
+//! * Encrypted PDFs and documents certified with DocMDP `P=1` are refused.
+//! * The `testkit` feature exposes fixture builders for tests and demos.
 
 mod appearance;
 mod crypto;
@@ -27,6 +31,7 @@ mod error;
 mod incremental;
 mod policy;
 mod sign;
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 mod trust;
 mod tsa;

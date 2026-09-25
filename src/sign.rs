@@ -1,4 +1,4 @@
-//! Signing path: insert a signature field + `adbe.pkcs7.detached` CMS signature.
+//! Signing path: insert a signature field + `ETSI.CAdES.detached` CMS signature.
 
 use std::path::Path;
 
@@ -7,7 +7,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::crypto::cms_sign;
 use crate::error::Error;
-use crate::incremental::{last_startxref, Incremental};
+use crate::incremental::{last_startxref, text_string, Incremental, Rendered};
 use crate::util::{find_sub, hex_encode};
 use crate::Result;
 
@@ -21,7 +21,7 @@ pub enum PadesLevel {
     Bb,
     /// B-B + an RFC 3161 signature timestamp (needs `tsa_url`).
     Bt,
-    /// B-T + a Document Security Store (certificates + CRLs).
+    /// B-T + a Document Security Store (certificates + CRLs + OCSP).
     Blt,
     /// B-LT + a document timestamp over the whole file (needs `tsa_url`).
     Blta,
@@ -55,7 +55,8 @@ pub struct Appearance {
     /// Optional logo image (PNG or JPEG) drawn in the box.
     pub image: Option<Vec<u8>>,
     /// Image placement `[x, y, width, height]` in box points. When `None`, the
-    /// image is drawn as a square on the left, sized to the box height.
+    /// image is drawn on the left, fitted to the box height (keeping its
+    /// aspect ratio), and the text starts to its right.
     pub image_rect: Option<[f64; 4]>,
 }
 
@@ -91,14 +92,15 @@ pub struct SignOptions {
     pub location: Option<String>,
     /// Optional `/ContactInfo`.
     pub contact_info: Option<String>,
-    /// Optional signing time, already formatted as a PDF date, e.g.
-    /// `D:20260614120000Z`.
+    /// Optional claimed signing time for the dictionary's `/M` entry, already
+    /// formatted as a PDF date, e.g. `D:20260614120000Z`. When `None`, the
+    /// current UTC time is written (PAdES baseline requires `/M`).
     pub signing_time: Option<String>,
     /// Optional visible appearance. When `None`, the signature is invisible
     /// (zero-area widget).
     pub appearance: Option<Appearance>,
-    /// Optional RFC 3161 Time-Stamping Authority `http://` URL. Required for
-    /// `PadesLevel::Bt` and above.
+    /// Optional RFC 3161 Time-Stamping Authority URL (`http://`, or `https://`
+    /// with the `https` feature). Required for `PadesLevel::Bt` and above.
     pub tsa_url: Option<String>,
     /// Target PAdES conformance level.
     pub pades_level: PadesLevel,
@@ -123,6 +125,10 @@ impl Default for SignOptions {
 }
 
 /// Sign `input` PDF, writing the signed PDF to `output`.
+///
+/// The output is written to a temporary file next to `output` and renamed into
+/// place, so a failure never leaves a truncated file behind (and `output` may
+/// safely equal `input`).
 pub fn sign_pdf_file(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -133,7 +139,30 @@ pub fn sign_pdf_file(
     let pdf = std::fs::read(input)?;
     let p12 = std::fs::read(keystore)?;
     let signed = sign_pdf_bytes(&pdf, &p12, password, opts)?;
-    std::fs::write(output, signed)?;
+    write_atomic(output.as_ref(), &signed)
+}
+
+/// Write `data` to `path` via a temporary sibling file + rename.
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::Io(std::io::Error::other("output path has no file name")))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = match dir {
+        Some(d) => d.join(tmp_name),
+        None => std::path::PathBuf::from(tmp_name),
+    };
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -152,25 +181,30 @@ pub fn sign_pdf_bytes(
             opts.pades_level
         )));
     }
+    let capacity_hex = opts
+        .signature_capacity
+        .checked_mul(2)
+        .filter(|_| opts.signature_capacity > 0)
+        .ok_or_else(|| Error::Malformed("invalid signature_capacity".into()))?;
+    if let Some(app) = &opts.appearance {
+        validate_appearance(app)?;
+    }
 
     // 1. Build an incremental update (keeps the original bytes verbatim, so any
     //    prior signature stays valid).
-    let mut buf = build_incremental_update(pdf, opts)?;
+    let (mut buf, sig_off) = build_incremental_update(pdf, opts)?;
 
-    // Our new placeholders live in the appended region; search from there so we
-    // never hit a previous signature's already-filled /ByteRange or /Contents.
-    let search_from = pdf.len();
-
-    // 3. Locate the /Contents placeholder (the hex string of zeros).
-    let (lt, gt) = locate_contents_placeholder(&buf, opts.signature_capacity, search_from)?;
+    // 2. Locate the /Contents placeholder (the hex string of zeros) inside the
+    //    signature object we just wrote — never by scanning arbitrary bytes.
+    let (lt, gt) = locate_contents_placeholder(&buf, opts.signature_capacity, sig_off)?;
     let p = lt; // index of '<'
     let q = gt + 1; // index just after '>'
     let total = buf.len();
 
-    // 4. Patch the /ByteRange in place (length-preserving, so p/q stay valid).
-    patch_byte_range(&mut buf, search_from, p as i64, q as i64, (total - q) as i64)?;
+    // 3. Patch the /ByteRange in place (length-preserving, so p/q stay valid).
+    patch_byte_range(&mut buf, sig_off, p as i64, q as i64, (total - q) as i64)?;
 
-    // 5. Build the detached CMS over everything except the Contents hole.
+    // 4. Build the detached CMS over everything except the Contents hole.
     let mut signed_bytes = Vec::with_capacity(p + (total - q));
     signed_bytes.extend_from_slice(&buf[..p]);
     signed_bytes.extend_from_slice(&buf[q..]);
@@ -180,28 +214,16 @@ pub fn sign_pdf_bytes(
         .flatten();
     let der = cms_sign(keystore_p12, password, &signed_bytes, sig_tsa)?;
 
-    // 6. Write the signature hex into the placeholder.
-    let hex = hex_encode(&der);
-    let capacity_hex = opts.signature_capacity * 2;
-    if hex.len() > capacity_hex {
-        return Err(Error::PlaceholderTooSmall {
-            needed: der.len(),
-            capacity: opts.signature_capacity,
-        });
-    }
-    let region = &mut buf[lt + 1..lt + 1 + capacity_hex];
-    for b in region.iter_mut() {
-        *b = b'0';
-    }
-    region[..hex.len()].copy_from_slice(&hex);
+    // 5. Write the signature hex into the placeholder.
+    fill_placeholder(&mut buf, lt, capacity_hex, &der, opts.signature_capacity)?;
 
-    // 7. PAdES-B-LT: add a Document Security Store with the validation material.
+    // 6. PAdES-B-LT: add a Document Security Store with the validation material.
     if opts.pades_level >= PadesLevel::Blt {
         let material = crate::dss::collect_validation_material(&der)?;
         buf = crate::dss::add_dss(&buf, &material)?;
     }
 
-    // 8. PAdES-B-LTA: add a document timestamp over the whole file (incl. DSS).
+    // 7. PAdES-B-LTA: add a document timestamp over the whole file (incl. DSS).
     if opts.pades_level >= PadesLevel::Blta {
         let url = opts
             .tsa_url
@@ -213,31 +235,18 @@ pub fn sign_pdf_bytes(
     Ok(buf)
 }
 
-/// Add a document timestamp (`/DocTimeStamp`, `/SubFilter /ETSI.RFC3161`) over
-/// the whole file as an incremental update — the archival anchor of PAdES-B-LTA.
-fn add_document_timestamp(pdf: &[u8], tsa_url: &str, capacity: usize) -> Result<Vec<u8>> {
-    let mut buf = build_doctimestamp_update(pdf, capacity)?;
-
-    let start = pdf.len();
-    let (lt, gt) = locate_contents_placeholder(&buf, capacity, start)?;
-    let p = lt;
-    let q = gt + 1;
-    let total = buf.len();
-    patch_byte_range(&mut buf, start, p as i64, q as i64, (total - q) as i64)?;
-
-    let mut signed = Vec::with_capacity(p + (total - q));
-    signed.extend_from_slice(&buf[..p]);
-    signed.extend_from_slice(&buf[q..]);
-
-    // The timestamp imprint is over the document byte range itself.
-    let token = crate::tsa::request_timestamp(tsa_url, &signed)?;
-    let token_der = token.to_der().map_err(|e| Error::Malformed(e.to_string()))?;
-
-    let hex = hex_encode(&token_der);
-    let capacity_hex = capacity * 2;
+/// Hex-encode `der` into the placeholder starting at `lt` (`<`), zero-padded.
+fn fill_placeholder(
+    buf: &mut [u8],
+    lt: usize,
+    capacity_hex: usize,
+    der: &[u8],
+    capacity: usize,
+) -> Result<()> {
+    let hex = hex_encode(der);
     if hex.len() > capacity_hex {
         return Err(Error::PlaceholderTooSmall {
-            needed: token_der.len(),
+            needed: der.len(),
             capacity,
         });
     }
@@ -246,26 +255,98 @@ fn add_document_timestamp(pdf: &[u8], tsa_url: &str, capacity: usize) -> Result<
         *b = b'0';
     }
     region[..hex.len()].copy_from_slice(&hex);
+    Ok(())
+}
+
+/// Add a document timestamp (`/DocTimeStamp`, `/SubFilter /ETSI.RFC3161`) over
+/// the whole file as an incremental update — the archival anchor of PAdES-B-LTA.
+fn add_document_timestamp(pdf: &[u8], tsa_url: &str, capacity: usize) -> Result<Vec<u8>> {
+    let (mut buf, ts_off) = build_doctimestamp_update(pdf, capacity)?;
+
+    let (lt, gt) = locate_contents_placeholder(&buf, capacity, ts_off)?;
+    let p = lt;
+    let q = gt + 1;
+    let total = buf.len();
+    patch_byte_range(&mut buf, ts_off, p as i64, q as i64, (total - q) as i64)?;
+
+    let mut signed = Vec::with_capacity(p + (total - q));
+    signed.extend_from_slice(&buf[..p]);
+    signed.extend_from_slice(&buf[q..]);
+
+    // The timestamp imprint is over the document byte range itself.
+    let token = crate::tsa::request_timestamp(tsa_url, &signed)?;
+    let token_der = token.to_der().map_err(|e| Error::Malformed(e.to_string()))?;
+    fill_placeholder(&mut buf, lt, capacity * 2, &token_der, capacity)?;
     Ok(buf)
 }
 
-/// Incremental update carrying an empty `/DocTimeStamp` signature field.
-fn build_doctimestamp_update(pdf: &[u8], capacity: usize) -> Result<Vec<u8>> {
+/// Parse the document for an incremental update, refusing inputs this crate
+/// cannot sign safely: encrypted files (the update would be written in clear
+/// and the reader-side decryption would corrupt it) and documents certified
+/// with a DocMDP permission of 1 (no changes allowed — a signature would
+/// invalidate the certification).
+pub(crate) fn load_for_update(pdf: &[u8]) -> Result<Document> {
     let doc = Document::load_mem(pdf)?;
+    if doc.is_encrypted() || doc.encryption_state.is_some() {
+        return Err(Error::Malformed(
+            "the PDF is encrypted; signing encrypted documents is not supported".into(),
+        ));
+    }
+    if docmdp_forbids_changes(&doc) {
+        return Err(Error::Malformed(
+            "the PDF is certified (DocMDP P=1: no changes allowed); adding a signature would invalidate it".into(),
+        ));
+    }
+    Ok(doc)
+}
+
+/// True if the catalog's `/Perms /DocMDP` signature carries a transform with
+/// `/P 1`.
+fn docmdp_forbids_changes(doc: &Document) -> bool {
+    let resolve = |o: &Object| -> Option<Dictionary> {
+        match o {
+            Object::Dictionary(d) => Some(d.clone()),
+            Object::Reference(r) => doc.get_object(*r).ok()?.as_dict().ok().cloned(),
+            _ => None,
+        }
+    };
+    let Some(catalog) = doc.catalog().ok() else {
+        return false;
+    };
+    let Some(perms) = catalog.get(b"Perms").ok().and_then(resolve) else {
+        return false;
+    };
+    let Some(sig) = perms.get(b"DocMDP").ok().and_then(resolve) else {
+        return false;
+    };
+    let Ok(refs) = sig.get(b"Reference").and_then(Object::as_array) else {
+        return false;
+    };
+    refs.iter().filter_map(resolve).any(|r| {
+        r.get(b"TransformMethod").ok().and_then(|o| o.as_name().ok()) == Some(b"DocMDP")
+            && r
+                .get(b"TransformParams")
+                .ok()
+                .and_then(resolve)
+                .and_then(|tp| tp.get(b"P").ok().and_then(|p| p.as_i64().ok()))
+                .unwrap_or(2)
+                == 1
+    })
+}
+
+/// Incremental update carrying an empty `/DocTimeStamp` signature field.
+/// Returns the buffer and the offset of the timestamp dictionary object.
+fn build_doctimestamp_update(pdf: &[u8], capacity: usize) -> Result<(Vec<u8>, usize)> {
+    let doc = load_for_update(pdf)?;
     let root_id = doc.trailer.get(b"Root")?.as_reference()?;
     let page_id = nth_page_id(&doc, 1)?;
 
     let mut inc = Incremental::new(pdf);
     let mut next_id = doc.max_id + 1;
-    let mut alloc = || {
-        let id = (next_id, 0u16);
-        next_id += 1;
-        id
-    };
 
-    let ts_id = alloc();
+    let ts_id = alloc_id(&mut next_id);
     inc.add(ts_id, build_doctimestamp_dict(capacity));
-    let widget_id = alloc();
+    let widget_id = alloc_id(&mut next_id);
     // Reuse the invisible-widget builder (no appearance), pointing at the TS dict.
     inc.add(widget_id, build_widget(&SignOptions::default(), ts_id, None));
 
@@ -275,8 +356,8 @@ fn build_doctimestamp_update(pdf: &[u8], capacity: usize) -> Result<Vec<u8>> {
     let size = next_id;
     let prev = last_startxref(pdf)
         .ok_or_else(|| Error::Malformed("original PDF has no startxref".into()))?;
-    let id_array = doc.trailer.get(b"ID").ok().cloned();
-    Ok(inc.render(size, root_id, prev, id_array))
+    let Rendered { bytes, offsets } = inc.render(size, root_id, prev, &doc.trailer);
+    Ok((bytes, offsets[&ts_id.0]))
 }
 
 /// The `/DocTimeStamp` dictionary with ByteRange/Contents placeholders.
@@ -285,15 +366,7 @@ fn build_doctimestamp_dict(capacity: usize) -> Object {
     sig.set("Type", Object::Name(b"DocTimeStamp".to_vec()));
     sig.set("Filter", Object::Name(b"Adobe.PPKLite".to_vec()));
     sig.set("SubFilter", Object::Name(b"ETSI.RFC3161".to_vec()));
-    sig.set(
-        "ByteRange",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(9_999_999_999),
-            Object::Integer(9_999_999_999),
-            Object::Integer(9_999_999_999),
-        ]),
-    );
+    sig.set("ByteRange", byte_range_placeholder());
     sig.set(
         "Contents",
         Object::String(vec![0u8; capacity], StringFormat::Hexadecimal),
@@ -301,8 +374,16 @@ fn build_doctimestamp_dict(capacity: usize) -> Object {
     Object::Dictionary(sig)
 }
 
-/// Assemble the incremental-update section (with signature placeholders) and
-/// return `original_bytes + update`.
+/// Ten-digit sentinels reserve enough width for any realistic file offset.
+fn byte_range_placeholder() -> Object {
+    Object::Array(vec![
+        Object::Integer(0),
+        Object::Integer(9_999_999_999),
+        Object::Integer(9_999_999_999),
+        Object::Integer(9_999_999_999),
+    ])
+}
+
 /// Allocate the next object id (generation 0) and advance the counter.
 fn alloc_id(next_id: &mut u32) -> ObjectId {
     let id = (*next_id, 0u16);
@@ -310,8 +391,10 @@ fn alloc_id(next_id: &mut u32) -> ObjectId {
     id
 }
 
-fn build_incremental_update(pdf: &[u8], opts: &SignOptions) -> Result<Vec<u8>> {
-    let doc = Document::load_mem(pdf)?;
+/// Assemble the incremental-update section (with signature placeholders) and
+/// return `original_bytes + update` plus the offset of the signature object.
+fn build_incremental_update(pdf: &[u8], opts: &SignOptions) -> Result<(Vec<u8>, usize)> {
+    let doc = load_for_update(pdf)?;
     let root_id = doc.trailer.get(b"Root")?.as_reference()?;
     let page_number = opts.appearance.as_ref().map(|a| a.page).unwrap_or(1);
     let page_id = nth_page_id(&doc, page_number)?;
@@ -337,9 +420,49 @@ fn build_incremental_update(pdf: &[u8], opts: &SignOptions) -> Result<Vec<u8>> {
     let size = next_id; // highest object id allocated + 1
     let prev = last_startxref(pdf)
         .ok_or_else(|| Error::Malformed("original PDF has no startxref".into()))?;
-    let id_array = doc.trailer.get(b"ID").ok().cloned();
+    let Rendered { bytes, offsets } = inc.render(size, root_id, prev, &doc.trailer);
+    Ok((bytes, offsets[&sig_id.0]))
+}
 
-    Ok(inc.render(size, root_id, prev, id_array))
+/// Reject appearance geometry that would serialize to invalid PDF numbers.
+fn validate_appearance(app: &Appearance) -> Result<()> {
+    let nums = [app.x, app.y, app.width, app.height, app.font_size];
+    if nums.iter().any(|v| !v.is_finite()) {
+        return Err(Error::Malformed("appearance geometry must be finite".into()));
+    }
+    if app.width <= 0.0 || app.height <= 0.0 || app.font_size <= 0.0 {
+        return Err(Error::Malformed(
+            "appearance width, height and font_size must be positive".into(),
+        ));
+    }
+    if let Some(r) = app.image_rect {
+        if r.iter().any(|v| !v.is_finite()) || r[2] <= 0.0 || r[3] <= 0.0 {
+            return Err(Error::Malformed("invalid appearance image_rect".into()));
+        }
+    }
+    if app.page == 0 {
+        return Err(Error::Malformed("appearance page numbers are 1-based".into()));
+    }
+    Ok(())
+}
+
+/// Current UTC time as a PDF date string, `D:YYYYMMDDHHmmSSZ`.
+fn pdf_date_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dt = der::DateTime::from_unix_duration(std::time::Duration::from_secs(secs))
+        .unwrap_or(der::DateTime::new(1970, 1, 1, 0, 0, 0).expect("epoch"));
+    format!(
+        "D:{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minutes(),
+        dt.seconds()
+    )
 }
 
 /// The signature `/Sig` dictionary, with ByteRange/Contents placeholders.
@@ -348,35 +471,27 @@ fn build_sig_dict(opts: &SignOptions) -> Object {
     sig.set("Type", Object::Name(b"Sig".to_vec()));
     sig.set("Filter", Object::Name(b"Adobe.PPKLite".to_vec()));
     sig.set("SubFilter", Object::Name(b"ETSI.CAdES.detached".to_vec()));
-    // Ten-digit sentinels reserve enough width for any realistic file offset.
-    sig.set(
-        "ByteRange",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(9_999_999_999),
-            Object::Integer(9_999_999_999),
-            Object::Integer(9_999_999_999),
-        ]),
-    );
+    sig.set("ByteRange", byte_range_placeholder());
     sig.set(
         "Contents",
         Object::String(vec![0u8; opts.signature_capacity], StringFormat::Hexadecimal),
     );
     if let Some(r) = &opts.reason {
-        sig.set("Reason", Object::string_literal(r.clone()));
+        sig.set("Reason", text_string(r));
     }
     if let Some(n) = &opts.name {
-        sig.set("Name", Object::string_literal(n.clone()));
+        sig.set("Name", text_string(n));
     }
     if let Some(l) = &opts.location {
-        sig.set("Location", Object::string_literal(l.clone()));
+        sig.set("Location", text_string(l));
     }
     if let Some(c) = &opts.contact_info {
-        sig.set("ContactInfo", Object::string_literal(c.clone()));
+        sig.set("ContactInfo", text_string(c));
     }
-    if let Some(t) = &opts.signing_time {
-        sig.set("M", Object::string_literal(t.clone()));
-    }
+    // PAdES baseline (ETSI EN 319 142-1) requires the claimed signing time in
+    // `/M` and forbids the CMS `signing-time` attribute.
+    let m = opts.signing_time.clone().unwrap_or_else(pdf_date_now);
+    sig.set("M", Object::string_literal(m));
     Object::Dictionary(sig)
 }
 
@@ -418,14 +533,20 @@ fn rect_array(x1: f64, y1: f64, x2: f64, y2: f64) -> Object {
     ])
 }
 
-/// First object id of page `page_number` (1-based), falling back to page 1.
+/// Object id of page `page_number` (1-based). An out-of-range page is an
+/// error rather than a silent fallback to page 1.
 fn nth_page_id(doc: &Document, page_number: usize) -> Result<ObjectId> {
     let pages = doc.get_pages();
-    pages
-        .get(&(page_number as u32))
-        .copied()
-        .or_else(|| pages.values().next().copied())
-        .ok_or_else(|| Error::Malformed("PDF has no pages".into()))
+    if pages.is_empty() {
+        return Err(Error::Malformed("PDF has no pages".into()));
+    }
+    let n = u32::try_from(page_number).unwrap_or(u32::MAX);
+    pages.get(&n).copied().ok_or_else(|| {
+        Error::Malformed(format!(
+            "page {page_number} does not exist (document has {} pages)",
+            pages.len()
+        ))
+    })
 }
 
 /// Add the widget to the target page's `/Annots`, re-emitting only what changed.
@@ -462,7 +583,9 @@ fn apply_widget_to_page(
 }
 
 /// Register the field in `/AcroForm` (creating it if absent), re-emitting only
-/// the object that actually changes.
+/// the object that actually changes. `/NeedAppearances` is cleared: a viewer
+/// regenerating field appearances after signing would report the document as
+/// changed.
 fn apply_field_to_acroform(
     doc: &Document,
     inc: &mut Incremental,
@@ -478,6 +601,7 @@ fn apply_field_to_acroform(
             let mut form = doc.get_object(af)?.as_dict()?.clone();
             add_field_to_form(doc, inc, &mut form, widget_ref)?;
             form.set("SigFlags", Object::Integer(3));
+            form.remove(b"NeedAppearances");
             inc.add(af, Object::Dictionary(form));
         }
         Ok(Object::Dictionary(d)) => {
@@ -485,6 +609,7 @@ fn apply_field_to_acroform(
             let mut form = d.clone();
             add_field_to_form(doc, inc, &mut form, widget_ref)?;
             form.set("SigFlags", Object::Integer(3));
+            form.remove(b"NeedAppearances");
             catalog.set("AcroForm", Object::Dictionary(form));
             inc.add(root_id, Object::Dictionary(catalog));
         }
@@ -526,37 +651,41 @@ fn add_field_to_form(
     }
     Ok(())
 }
-/// Find the `< 00..00 >` placeholder at or after `start`, returning the `<` and
-/// `>` indices. `start` skips any prior (already-filled) signature.
+
+/// Find the `< 00..00 >` placeholder of the signature object that starts at
+/// `obj_off`, returning the `<` and `>` indices. The search is confined to that
+/// object (up to its `endobj`), so no other object's `/Contents` can be hit.
 fn locate_contents_placeholder(
     buf: &[u8],
     capacity: usize,
-    start: usize,
+    obj_off: usize,
 ) -> Result<(usize, usize)> {
-    // Search after /ByteRange so we never collide with a page's /Contents.
-    let br = start
-        + find_sub(&buf[start..], b"/ByteRange")
-            .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
-    let rel = find_sub(&buf[br..], b"/Contents")
-        .ok_or_else(|| Error::Malformed("/Contents not found".into()))?;
-    let from = br + rel;
-    let lt_rel = find_sub(&buf[from..], b"<")
-        .ok_or_else(|| Error::Malformed("Contents '<' not found".into()))?;
-    let lt = from + lt_rel;
+    let end = obj_off
+        + find_sub(&buf[obj_off..], b"endobj")
+            .ok_or_else(|| Error::Malformed("signature object not terminated".into()))?;
+    let obj = &buf[obj_off..end];
+    let br = find_sub(obj, b"/ByteRange")
+        .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
+    let from = br
+        + find_sub(&obj[br..], b"/Contents")
+            .ok_or_else(|| Error::Malformed("/Contents not found".into()))?;
+    let lt = from
+        + find_sub(&obj[from..], b"<")
+            .ok_or_else(|| Error::Malformed("Contents '<' not found".into()))?;
     let gt = lt + 1 + capacity * 2;
-    if gt >= buf.len() || buf[gt] != b'>' {
+    if gt >= obj.len() || obj[gt] != b'>' {
         return Err(Error::Malformed(
             "Contents placeholder size mismatch".into(),
         ));
     }
-    Ok((lt, gt))
+    Ok((obj_off + lt, obj_off + gt))
 }
 
-/// Replace the `/ByteRange [...]` array (at or after `start`) with concrete
-/// offsets, padding with spaces so the byte length is unchanged.
-fn patch_byte_range(buf: &mut [u8], start: usize, a: i64, b: i64, c: i64) -> Result<()> {
-    let br = start
-        + find_sub(&buf[start..], b"/ByteRange")
+/// Replace the `/ByteRange [...]` array of the signature object at `obj_off`
+/// with concrete offsets, padding with spaces so the byte length is unchanged.
+fn patch_byte_range(buf: &mut [u8], obj_off: usize, a: i64, b: i64, c: i64) -> Result<()> {
+    let br = obj_off
+        + find_sub(&buf[obj_off..], b"/ByteRange")
             .ok_or_else(|| Error::Malformed("/ByteRange not found".into()))?;
     let open = br + find_sub(&buf[br..], b"[")
         .ok_or_else(|| Error::Malformed("ByteRange '[' not found".into()))?;

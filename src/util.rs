@@ -23,7 +23,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode an ASCII hex string into bytes. Ignores nothing; expects even length.
 pub(crate) fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     fn val(c: u8) -> Option<u8> {
@@ -53,13 +53,35 @@ pub(crate) fn der_total_len(b: &[u8]) -> Option<usize> {
         Some(2 + len_byte as usize)
     } else {
         let n = (len_byte & 0x7f) as usize;
-        if n == 0 || b.len() < 2 + n {
+        // A length-of-length wider than usize cannot describe anything we can
+        // hold; reject it instead of shifting bits away (checked arithmetic
+        // throughout so a crafted /Contents cannot panic the verifier).
+        if n == 0 || n > std::mem::size_of::<usize>() || b.len() < 2 + n {
             return None;
         }
         let mut len = 0usize;
         for i in 0..n {
-            len = (len << 8) | b[2 + i] as usize;
+            len = len.checked_shl(8)? | b[2 + i] as usize;
         }
-        Some(2 + n + len)
+        len.checked_add(2 + n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::der_total_len;
+
+    #[test]
+    fn der_total_len_rejects_overflowing_lengths() {
+        assert_eq!(der_total_len(&[0x30, 0x05]), Some(7));
+        assert_eq!(der_total_len(&[0x30, 0x82, 0x01, 0x00]), Some(4 + 256));
+        // 8 length bytes of 0xFF: 2 + 8 + usize::MAX overflows.
+        let mut b = vec![0x30, 0x88];
+        b.extend_from_slice(&[0xFF; 8]);
+        assert_eq!(der_total_len(&b), None);
+        // Length-of-length wider than usize.
+        let mut b = vec![0x30, 0x89];
+        b.extend_from_slice(&[0x01; 9]);
+        assert_eq!(der_total_len(&b), None);
     }
 }

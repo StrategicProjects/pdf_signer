@@ -1,5 +1,6 @@
 //! `pdf_signer` command-line interface.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -56,9 +57,15 @@ struct SignArgs {
     output: PathBuf,
     /// PKCS#12 (.p12/.pfx) keystore.
     keystore: PathBuf,
-    /// Keystore password.
-    #[arg(short, long, env = "KEY_PASSWORD")]
-    password: String,
+    /// Keystore password. Prefer `KEY_PASSWORD` in the environment or
+    /// `--password-file` so the secret does not appear in the process list.
+    #[arg(short, long, env = "KEY_PASSWORD", hide_env_values = true,
+          conflicts_with = "password_file")]
+    password: Option<String>,
+    /// Read the keystore password from this file (first line), or from stdin
+    /// when the path is `-`.
+    #[arg(long, value_name = "FILE")]
+    password_file: Option<PathBuf>,
 
     /// PAdES level. `bt`+ require `--tsa-url`.
     #[arg(long, value_enum, default_value = "bb")]
@@ -67,6 +74,10 @@ struct SignArgs {
     /// feature, https://).
     #[arg(long)]
     tsa_url: Option<String>,
+    /// Bytes reserved for the signature (`/Contents`). Raise it if signing
+    /// fails with "does not fit in reserved placeholder".
+    #[arg(long, default_value_t = 30000)]
+    signature_capacity: usize,
 
     /// `/Reason` for signing.
     #[arg(long)]
@@ -77,32 +88,35 @@ struct SignArgs {
     /// `/Location`.
     #[arg(long)]
     location: Option<String>,
+    /// `/ContactInfo`.
+    #[arg(long)]
+    contact_info: Option<String>,
 
     /// Draw a visible signature box with this text (enables a visible signature).
     #[arg(long)]
     text: Option<String>,
     /// Page for the visible box (1-based).
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, requires = "text")]
     page: usize,
     /// Visible box geometry, in points.
-    #[arg(long, default_value_t = 36.0)]
+    #[arg(long, default_value_t = 36.0, requires = "text")]
     x: f64,
-    #[arg(long, default_value_t = 36.0)]
+    #[arg(long, default_value_t = 36.0, requires = "text")]
     y: f64,
-    #[arg(long, default_value_t = 320.0)]
+    #[arg(long, default_value_t = 320.0, requires = "text")]
     width: f64,
-    #[arg(long, default_value_t = 64.0)]
+    #[arg(long, default_value_t = 64.0, requires = "text")]
     height: f64,
-    #[arg(long, default_value_t = 8.0)]
+    #[arg(long, default_value_t = 8.0, requires = "text")]
     font_size: f64,
     /// Drop the box border.
-    #[arg(long)]
+    #[arg(long, requires = "text")]
     no_border: bool,
     /// TrueType/OpenType font file to embed in the box.
-    #[arg(long)]
+    #[arg(long, requires = "text")]
     font: Option<PathBuf>,
     /// PNG/JPEG logo to draw in the box.
-    #[arg(long)]
+    #[arg(long, requires = "text")]
     image: Option<PathBuf>,
 }
 
@@ -122,7 +136,35 @@ fn main() -> ExitCode {
     }
 }
 
+/// Resolve the keystore password from `--password`/`KEY_PASSWORD` or
+/// `--password-file`.
+fn password(a: &SignArgs) -> Result<String, String> {
+    if let Some(p) = &a.password {
+        return Ok(p.clone());
+    }
+    let Some(path) = &a.password_file else {
+        return Err("no password given: use --password, KEY_PASSWORD or --password-file".into());
+    };
+    let mut text = String::new();
+    if path.as_os_str() == "-" {
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| format!("reading password from stdin: {e}"))?;
+    } else {
+        text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading password file: {e}"))?;
+    }
+    Ok(text.lines().next().unwrap_or("").to_string())
+}
+
 fn run_sign(a: SignArgs) -> ExitCode {
+    let password = match password(&a) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let appearance = a.text.as_ref().map(|text| {
         Ok::<_, std::io::Error>(Appearance {
             page: a.page,
@@ -147,16 +189,18 @@ fn run_sign(a: SignArgs) -> ExitCode {
     };
 
     let opts = SignOptions {
+        signature_capacity: a.signature_capacity,
         reason: a.reason,
         name: a.name,
         location: a.location,
+        contact_info: a.contact_info,
         tsa_url: a.tsa_url,
         pades_level: a.level.into(),
         appearance,
         ..Default::default()
     };
 
-    match sign_pdf_file(&a.input, &a.output, &a.keystore, &a.password, &opts) {
+    match sign_pdf_file(&a.input, &a.output, &a.keystore, &password, &opts) {
         Ok(()) => {
             println!("signed: {} -> {}", a.input.display(), a.output.display());
             ExitCode::SUCCESS
@@ -170,7 +214,7 @@ fn run_sign(a: SignArgs) -> ExitCode {
 
 fn run_verify(a: VerifyArgs) -> ExitCode {
     // When a trust store is supplied, the chain must be trusted for success;
-    // otherwise we can only attest to cryptographic validity.
+    // otherwise we can only attest to cryptographic validity + integrity.
     let roots_supplied = a.roots.is_some();
     let report = if let Some(roots_path) = &a.roots {
         let pem = match std::fs::read(roots_path) {
@@ -204,7 +248,11 @@ fn run_verify(a: VerifyArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     for (i, s) in report.signatures.iter().enumerate() {
-        println!("signature #{}:", i + 1);
+        println!(
+            "{} #{}:",
+            if s.is_timestamp { "document timestamp" } else { "signature" },
+            i + 1
+        );
         println!("  valid:                 {}", s.valid);
         println!("  signer:                {}", s.signer.as_deref().unwrap_or("-"));
         println!(
@@ -213,6 +261,10 @@ fn run_verify(a: VerifyArgs) -> ExitCode {
         );
         println!("  covers_whole_document: {}", s.covers_whole_document);
         println!("  detail:                {}", s.detail);
+    }
+    println!("document_intact:         {}", report.document_intact);
+    if !report.document_intact {
+        eprintln!("error: the document was modified after the last signature");
     }
 
     if roots_supplied {

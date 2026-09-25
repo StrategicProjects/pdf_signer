@@ -1,7 +1,7 @@
 # pdf_signer
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![PAdES](https://img.shields.io/badge/PAdES-B--B%20%E2%86%92%20B--LTA-success.svg)](#pades-levels)
 ![pure Rust](https://img.shields.io/badge/crypto-pure%20RustCrypto-success.svg)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21366481-blue.svg)](https://doi.org/10.5281/zenodo.21366481)
@@ -20,11 +20,13 @@ powers the [`signer`](https://github.com/StrategicProjects/signer) R package on
 CRAN). TLS is the only optional, opt-in exception (for HTTPS timestamp/CRL
 endpoints).
 
-Every signature this produces is cross-validated by **Poppler's `pdfsig`** and
-opens as valid in Adobe Reader.
+The signatures it produces are checked against **Poppler's `pdfsig`** and
+`qpdf --check` during development (RSA/ECDSA; Adobe Reader does not validate
+Ed25519 yet), and its own verifier is exercised offline by an in-process
+RFC 3161 TSA in the test suite.
 
 ```console
-$ cargo run --example gen_assets        # writes sample.pdf + keystore.p12
+$ cargo run --features testkit --example gen_assets   # writes sample.pdf + keystore.p12
 $ pdf_signer sign sample.pdf signed.pdf keystore.p12 \
       --password password --reason "Approved" --level blta \
       --tsa-url http://timestamp.digicert.com \
@@ -34,11 +36,18 @@ signature #1:
   valid:                 true
   signer:                CN=...
   chain_trusted:         true
-  detail:                valid CMS signature; signer: ...
+  covers_whole_document: false
+  detail:                valid CMS signature; signer: ...; chain: ... [trusted timestamp]
+document timestamp #2:
+  valid:                 true
+  signer:                CN=DigiCert Timestamp ...
+  chain_trusted:         true
+  covers_whole_document: true
+  detail:                valid document timestamp (RFC 3161); TSA chain: ...
+document_intact:         true
 $ pdfsig signed.pdf
   - Signature Type: ETSI.CAdES.detached
   - Signature Validation: Signature is Valid.
-  - Total document signed
 ```
 
 Run `pdf_signer sign --help` / `verify --help` for all options.
@@ -57,20 +66,31 @@ Run `pdf_signer sign --help` / `verify --help` for all options.
   CRLs **and OCSP responses** fetched from the certificates' distribution points
   / responders (B-LT).
 - **Verification** — locates signatures by document **structure** (not raw byte
-  scanning), re-derives the signed byte range, checks the message digest and the
-  signer's signature, binds the `/ByteRange` to the `/Contents`, and reports each
-  signature *and* document timestamp. RFC 3161 **timestamp tokens are validated
-  cryptographically** (TSTInfo, TSA signature, imprint binding).
+  scanning), re-derives the signed byte range, checks the CMS profile
+  (`content-type`, `message-digest`, ESS `signing-certificate-v2` binding, one
+  SignerInfo, declared algorithms) and the signer's signature, binds the
+  `/ByteRange` to the `/Contents`, and reports each signature *and* document
+  timestamp. **Document integrity** is judged as a whole: the report is only
+  `all_valid`/`all_trusted` when nothing but a `/DSS` was appended after the
+  last signature or document timestamp (the classic "incremental update after
+  signing" attack is rejected). RFC 3161 **timestamp tokens are validated
+  cryptographically** (TSTInfo, TSA signature, imprint binding, nonce) and
+  their TSAs are chain-validated **as TSAs** (`id-kp-timeStamping` required).
 - **Certificate-chain validation** against a trust store (e.g. the **ICP-Brasil**
   roots): path building with **backtracking** (cross-signing / multiple
   intermediates), per-link signature (RSA, ECDSA P-256/P-384, Ed25519), validity,
-  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, **authenticated CRL +
-  OCSP** revocation (signature, freshness and scope checked), **name constraints**
-  (§4.2.1.10), and the full **policy engine** (`valid_policy_tree`, policy
-  mapping) with an optional required-policy set. For PAdES-B-T and above the
-  chain is judged at the **timestamp's `genTime`** (when the timestamp and its
-  TSA are trusted), not at "now", so a signature stays valid after the
-  certificate expires.
+  `basicConstraints` / `pathLenConstraint` / `keyCertSign`, leaf `keyUsage`,
+  **critical-extension processing** (unknown critical or malformed extensions
+  fail the path), **authenticated CRL + OCSP** revocation (signature and scope
+  checked; a revocation dated at or before the validation time counts even if
+  the evidence was issued later, per RFC 3161 App. B), **name constraints**
+  (§4.2.1.10), the full **policy engine** (`valid_policy_tree`, policy mapping)
+  with an optional required-policy set, and a bounded path search (a hostile
+  certificate pool cannot make verification run for hours). For PAdES-B-T and
+  above the chain is judged at the **timestamp's `genTime`** (when the
+  timestamp verifies and its TSA is trusted — at the current time, or at a
+  later trusted archival timestamp for B-LTA), not at "now", so a signature
+  stays valid after the certificate expires.
 - **RSA, ECDSA and Ed25519** signing keys (RSA PKCS#1 v1.5 + SHA-256; ECDSA
   P-256/SHA-256 and P-384/SHA-384; Ed25519 per RFC 8419), detected automatically
   from the keystore.
@@ -82,7 +102,7 @@ Run `pdf_signer sign --help` / `verify --help` for all options.
 |------------|----------------------------------------------------|---------------|-------------|
 | **B-B**    | `signing-certificate-v2` (CAdES baseline)          | `Bb`          | no          |
 | **B-T**    | + RFC 3161 **signature timestamp**                 | `Bt`          | yes         |
-| **B-LT**   | + `/DSS` (certificate chain + CRLs)                | `Blt`         | yes         |
+| **B-LT**   | + `/DSS` (certificate chain + CRLs + OCSP), merged with any existing DSS | `Blt` | yes |
 | **B-LTA**  | + `/DocTimeStamp` over the whole file              | `Blta`        | yes         |
 
 ## Command-line interface
@@ -91,10 +111,10 @@ The crate ships a `pdf_signer` binary with two subcommands. Install it (or run
 it straight from a checkout):
 
 ```console
-$ cargo install --path .            # puts `pdf_signer` on your PATH
+$ cargo install --path . --features cli      # puts `pdf_signer` on your PATH
 # …or, without installing:
-$ cargo run --release -- sign  …    # everything after `--` is forwarded
-$ cargo run --release -- verify …
+$ cargo run --release --features cli -- sign  …    # everything after `--` is forwarded
+$ cargo run --release --features cli -- verify …
 ```
 
 ### `sign`
@@ -106,10 +126,11 @@ $ pdf_signer sign <INPUT> <OUTPUT> <KEYSTORE> --password <PWD> [options]
 | Argument / flag | Meaning |
 | --- | --- |
 | `<INPUT>` `<OUTPUT>` `<KEYSTORE>` | input PDF, signed output PDF, PKCS#12 `.p12`/`.pfx` |
-| `-p, --password` | keystore password (or set `KEY_PASSWORD` in the environment) |
+| `-p, --password` | keystore password; prefer `KEY_PASSWORD` in the environment or `--password-file <FILE>` (`-` = stdin) so it stays out of the process list |
 | `--level <bb\|bt\|blt\|blta>` | PAdES level (default `bb`); `bt`+ need `--tsa-url` |
 | `--tsa-url <URL>` | RFC 3161 timestamp authority (`http://`, or `https://` with the `https` feature) |
-| `--reason` / `--name` / `--location` | signature dictionary metadata |
+| `--signature-capacity <BYTES>` | space reserved for the signature (default 30000; raise for long TSA chains) |
+| `--reason` / `--name` / `--location` / `--contact-info` | signature dictionary metadata (UTF-8 is written as UTF-16 text strings) |
 | `--text <STR>` | draw a **visible** signature box with this text |
 | `--page --x --y --width --height --font-size` | box placement/size, in points |
 | `--no-border` | omit the box border |
@@ -144,12 +165,15 @@ signature #1:
   signer:                CN=…
   chain_trusted:         true
   covers_whole_document: true
-  detail:                valid CMS signature; signer: …
+  detail:                valid CMS signature; signer: …; chain: chains to trusted root (…) [no trusted timestamp (…); at now]
+document_intact:         true
 ```
 
-The process exits `0` only when at least one signature is present and all found
-signatures are valid. Run `pdf_signer sign --help` / `verify --help` for the
-full, authoritative list of options.
+The process exits `0` only when at least one signature is present, every
+signature and document timestamp is valid, the document is intact (nothing but
+a `/DSS` was appended after the last one) and — with `--roots` — every signer
+and TSA chains to a supplied root. Run `pdf_signer sign --help` /
+`verify --help` for the full, authoritative list of options.
 
 ## Library usage
 
@@ -165,6 +189,7 @@ sign_pdf_file("in.pdf", "out.pdf", "keystore.p12", "password", &SignOptions {
         page: 1, x: 36.0, y: 36.0, width: 320.0, height: 64.0,
         font_size: 8.0, border: true,
         text: "Digitally signed.\nValidate at: example.org/validate".into(),
+        ..Appearance::default()
     }),
     ..Default::default()
 })?;
@@ -175,13 +200,19 @@ let report = verify_pdf_file_with_roots("out.pdf", &roots)?;
 for s in &report.signatures {
     println!("valid={} trusted={:?} — {}", s.valid, s.chain_trusted, s.detail);
 }
+// The one-line verdict: every entry valid + trusted, and nothing changed after
+// the last signature (apart from a /DSS).
+assert!(report.all_trusted() && report.document_intact);
 ```
 
 The `https` feature enables TLS TSA/CRL endpoints:
 
 ```toml
-pdf_signer = { version = "0.1", features = ["https"] }
+pdf_signer = { version = "0.3", features = ["https"] }
 ```
+
+The `testkit` feature exposes the fixture builders used by the tests (sample
+PDFs, self-signed / CA-issued PKCS#12 keystores, an in-process RFC 3161 TSA).
 
 ## How it works
 
@@ -195,8 +226,10 @@ pdf_signer = { version = "0.1", features = ["https"] }
    Byte surgery (within the appended region) computes the real `/ByteRange` and
    patches it length-preservingly.
 3. **CMS** (`cms` + `rsa` + `sha2`) — build a detached SignedData with the
-   `contentType`, `messageDigest`, `signingTime` and `signing-certificate-v2`
-   signed attributes; optionally fetch and embed an RFC 3161 timestamp.
+   `contentType`, `messageDigest` and `signing-certificate-v2` signed
+   attributes (the claimed time goes in the dictionary's `/M`, as PAdES
+   baseline requires — no CMS `signing-time`); optionally fetch, verify and
+   embed an RFC 3161 timestamp (nonce-bound).
 4. **DSS / DocTimeStamp** (`dss.rs`) — collect the chain + CRLs into a `/DSS`,
    then append a document timestamp over the whole file.
 5. **Verify** (`verify.rs` + `trust.rs`) — enumerate signatures from the parsed
@@ -225,10 +258,24 @@ pdf_signer = { version = "0.1", features = ["https"] }
   crate's own verifier does.
 - Incremental updates match the source: a **traditional xref table** *or* a
   **cross-reference stream** (auto-detected), chained via `/Prev`.
-- Visible appearances can **embed a TrueType font** (a *simple* WinAnsi font —
-  Latin-1, not Type0/Unicode, so non-Latin-1 glyphs become `?`) and a **PNG or
-  JPEG logo**; the default font is standard Helvetica. Line wrapping is
-  approximate (character-count).
+- Visible appearances can **embed a TrueType or CFF OpenType font** (a *simple*
+  WinAnsi font — Latin-1, not Type0/Unicode, so non-Latin-1 glyphs become `?`;
+  `.ttc` collections are rejected) and a **PNG or JPEG logo** (RGB, gray or
+  CMYK); the default font is standard Helvetica. Line wrapping is approximate
+  (character-count).
+- **Refused inputs**: encrypted PDFs (even with an empty user password — the
+  update would be written in clear) and documents certified with DocMDP `P=1`.
+  Signing does not honour field locks or DocMDP `P=2/3` semantics beyond that.
+- **Revocation evidence collection is best-effort**: an unreachable CRL
+  distribution point or OCSP responder is skipped, so a B-LT signature made
+  offline carries certificates only. Verification then soft-fails (no evidence
+  ≠ revoked); a hard-fail mode is not yet implemented.
+- **Long-term validation** relies on document timestamps: a signature
+  timestamp's TSA is validated at the current time or at the `genTime` of a
+  later *trusted* document timestamp (B-LTA). Without such an archival
+  timestamp, a signature whose TSA certificate has expired is judged at "now".
+- **RSASSA-PSS** signatures are not supported (reported as invalid, never
+  silently accepted); `SubjectKeyIdentifier` signer identifiers likewise.
 
 ## Roadmap
 
@@ -237,6 +284,7 @@ pdf_signer = { version = "0.1", features = ["https"] }
 - [x] PAdES B-B / B-T / B-LT / B-LTA (DSS + document timestamp)
 - [x] Certificate-chain validation (RSA + ECDSA, CRL + OCSP, RFC 5280 subset)
 - [x] Optional HTTPS (rustls) for TSA / CRL / OCSP
+- [x] Whole-document integrity verdict, TSA purpose validation, DSS merging (v0.3.0)
 - [x] [extendr](https://extendr.github.io/) bindings + vendoring for R / CRAN
 - [x] ECDSA signing keys (P-256 / P-384)
 - [x] RFC 5280 name constraints + required-policy check

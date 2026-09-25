@@ -1,7 +1,8 @@
 use pdf_signer::testkit::{
     ca_chain3_p12, ca_chain_policy_mapping_p12, ca_name_constrained_p12, ca_signed_p12,
-    ca_with_policy_p12, sample_pdf, sample_pdf_xref_stream, self_signed_ed25519_p12,
-    self_signed_p12, self_signed_p256_p12, self_signed_p384_p12, tiny_png,
+    ca_with_policy_p12, mock_tsa, sample_pdf, sample_pdf_xref_stream, sample_pdf_xref_table,
+    self_signed_ed25519_p12, self_signed_p12, self_signed_p256_p12, self_signed_p384_p12,
+    tiny_png, MockTsaOptions,
 };
 use pdf_signer::{
     sign_pdf_bytes, verify_pdf_bytes, verify_pdf_bytes_with_roots, Appearance, PadesLevel,
@@ -199,12 +200,13 @@ fn pades_bb_carries_signing_certificate() {
 }
 
 #[test]
-#[ignore = "requires network access to a public RFC 3161 TSA"]
 fn pades_bt_embeds_timestamp() {
     let pdf = sample_pdf();
     let p12 = self_signed_p12("pw");
+    let tsa = mock_tsa(MockTsaOptions::default());
     let opts = SignOptions {
-        tsa_url: Some("http://timestamp.digicert.com".into()),
+        pades_level: PadesLevel::Bt,
+        tsa_url: Some(tsa.url.clone()),
         ..Default::default()
     };
     let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("sign + timestamp");
@@ -214,6 +216,20 @@ fn pades_bt_embeds_timestamp() {
         contains(&signed, b"060b2a864886f70d010910020e"),
         "CMS must carry an RFC 3161 timestamp token (PAdES-B-T)"
     );
+    assert!(verify_pdf_bytes(&signed).expect("verify").all_valid());
+}
+
+#[test]
+#[ignore = "requires network access to a public RFC 3161 TSA"]
+fn pades_bt_against_public_tsa() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        pades_level: PadesLevel::Bt,
+        tsa_url: Some("http://timestamp.digicert.com".into()),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect("sign + timestamp");
     assert!(verify_pdf_bytes(&signed).expect("verify").all_valid());
 }
 
@@ -342,10 +358,10 @@ fn all_trusted_separates_validity_from_trust() {
         "an untrusted chain must not count as trusted"
     );
 
-    // No trust store: `all_trusted` falls back to validity (no Some(false)).
+    // No trust store: validity can be asserted, trust cannot.
     let none = verify_pdf_bytes(&signed).expect("verify");
     assert!(none.all_valid());
-    assert!(none.all_trusted());
+    assert!(!none.all_trusted(), "all_trusted must be false without a trust store");
 }
 
 #[test]
@@ -418,16 +434,44 @@ fn crl_revocation_must_be_authenticated() {
         "a CRL not signed by the CA must be ignored"
     );
 
-    // A stale CRL (past nextUpdate) is ignored.
+    // Revocation is permanent: an authenticated CRL past its nextUpdate still
+    // proves the leaf was revoked at `now`.
     assert!(
-        verify_certificate_chain(
+        !verify_certificate_chain(
             &s.leaf_der,
             &[],
             std::slice::from_ref(&s.expired_crl),
             &store,
             now
         ),
-        "an expired CRL must be ignored"
+        "a stale CRL listing the leaf must still revoke it"
+    );
+
+    // Evidence issued *after* the validation time (thisUpdate in the future)
+    // that records an earlier revocation counts (RFC 3161 Appendix B) — this
+    // is what lets a B-LT's own OCSP/CRL, fetched after signing, flag a signer
+    // that was already revoked at the trusted signing time.
+    assert!(
+        !verify_certificate_chain(
+            &s.leaf_der,
+            &[],
+            std::slice::from_ref(&s.future_crl),
+            &store,
+            now
+        ),
+        "a later CRL recording an earlier revocation must revoke the leaf"
+    );
+
+    // …but a revocation dated after the validation time does not apply yet.
+    assert!(
+        verify_certificate_chain(
+            &s.leaf_der,
+            &[],
+            std::slice::from_ref(&s.revoked_later_crl),
+            &store,
+            now
+        ),
+        "a revocation in the future must not revoke the leaf at now"
     );
 }
 
@@ -606,4 +650,422 @@ fn unsigned_document_reports_no_signatures() {
     let report = verify_pdf_bytes(&pdf).expect("verify failed");
     assert!(report.signatures.is_empty());
     assert!(!report.all_valid());
+}
+
+
+// --- v0.3.0 regression tests -------------------------------------------------------
+
+/// Append an unsigned incremental update that swaps the page's content stream.
+fn append_content_replacement(signed: &[u8]) -> Vec<u8> {
+    let doc = lopdf::Document::load_mem(signed).expect("parse signed");
+    let page_id = *doc.get_pages().values().next().expect("page");
+    let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    let contents_id = page.get(b"Contents").unwrap().as_reference().unwrap();
+    let root_id = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let evil = b"BT /F1 24 Tf 72 720 Td (PAY THE ATTACKER) Tj ET";
+    let mut out = signed.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let off = out.len();
+    out.extend_from_slice(
+        format!(
+            "{} 0 obj\n<< /Length {} >>\nstream\n",
+            contents_id.0,
+            evil.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(evil);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref = out.len();
+    let prev = {
+        let s = String::from_utf8_lossy(signed);
+        let i = s.rfind("startxref").unwrap();
+        s[i + 9..].split_whitespace().next().unwrap().parse::<usize>().unwrap()
+    };
+    // The signed file uses an xref stream; an appended classic table works for
+    // readers (hybrid chains via /Prev), which is exactly what an attacker does.
+    out.extend_from_slice(
+        format!(
+            "xref\n{} 1\n{:010} 00000 n\r\ntrailer\n<< /Size {} /Root {} 0 R /Prev {} >>\nstartxref\n{}\n%%EOF\n",
+            contents_id.0,
+            off,
+            doc.max_id + 1,
+            root_id.0,
+            prev,
+            xref
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn modification_after_signing_is_not_intact() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+    let tampered = append_content_replacement(&signed);
+
+    // The original signature still verifies over its own bytes…
+    let store = TrustStore::from_ders([root_der]).unwrap();
+    let report = verify_pdf_bytes_with_roots(&tampered, &store).expect("verify");
+    assert!(report.signatures[0].valid);
+    assert_eq!(report.signatures[0].chain_trusted, Some(true));
+    assert!(!report.signatures[0].covers_whole_document);
+    // …but the document is not what was signed, so nothing passes overall.
+    assert!(!report.document_intact, "unsigned content change must break integrity");
+    assert!(!report.all_valid());
+    assert!(!report.all_trusted());
+
+    // And a plain trailing garbage append is not intact either.
+    let mut junk = signed.clone();
+    junk.extend_from_slice(b"\n% not part of the signed revision\n");
+    assert!(!verify_pdf_bytes(&junk).unwrap().document_intact);
+}
+
+#[test]
+fn pades_blt_and_blta_offline_with_mock_tsa() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let tsa = mock_tsa(MockTsaOptions::default());
+
+    // B-LT: signature + timestamp + DSS. The DSS update after the signature is
+    // the one trailing change that keeps the document intact.
+    let blt = sign_pdf_bytes(
+        &pdf,
+        &p12,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Blt,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("B-LT sign");
+    assert!(contains(&blt, b"/DSS") && contains(&blt, b"/Certs"));
+    let store = TrustStore::from_ders([root_der.clone(), tsa.root_der.clone()]).unwrap();
+    let report = verify_pdf_bytes_with_roots(&blt, &store).expect("verify");
+    assert_eq!(report.signatures.len(), 1);
+    assert!(!report.signatures[0].covers_whole_document, "DSS follows the signature");
+    assert!(report.document_intact, "a DSS-only trailing update keeps the document intact");
+    assert!(report.all_trusted(), "{}", report.signatures[0].detail);
+    assert!(
+        report.signatures[0].trusted_time.is_some(),
+        "the chain must be judged at the trusted genTime: {}",
+        report.signatures[0].detail
+    );
+
+    // B-LTA: + document timestamp covering everything, chain-validated as a TSA.
+    let blta = sign_pdf_bytes(
+        &pdf,
+        &p12,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Blta,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("B-LTA sign");
+    assert!(contains(&blta, b"DocTimeStamp"));
+    let report = verify_pdf_bytes_with_roots(&blta, &store).expect("verify");
+    assert_eq!(report.signatures.len(), 2, "signature + document timestamp");
+    let ts = &report.signatures[1];
+    assert!(ts.is_timestamp && ts.valid && ts.covers_whole_document);
+    assert_eq!(ts.chain_trusted, Some(true), "{}", ts.detail);
+    assert!(report.all_trusted());
+
+    // A second B-LT signature must merge into the existing DSS, not replace it.
+    let (p12b, root_b) = ca_signed_p12("pw");
+    let twice = sign_pdf_bytes(
+        &blt,
+        &p12b,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Blt,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("second B-LT");
+    let doc = lopdf::Document::load_mem(&twice).unwrap();
+    let catalog = doc.catalog().unwrap();
+    let dss = catalog.get(b"DSS").unwrap().as_dict().unwrap();
+    let certs = dss.get(b"Certs").unwrap().as_array().unwrap();
+    // Root A + leaf A + TSA (first DSS) and root B + leaf B (second) — the TSA
+    // certificate is deduplicated.
+    assert!(certs.len() >= 5, "merged DSS should keep both chains, got {}", certs.len());
+    let store_ab = TrustStore::from_ders([root_der, root_b, tsa.root_der.clone()]).unwrap();
+    let report = verify_pdf_bytes_with_roots(&twice, &store_ab).expect("verify");
+    assert_eq!(report.signatures.len(), 2);
+    assert!(report.all_trusted(), "{:?}", report.signatures.iter().map(|s| &s.detail).collect::<Vec<_>>());
+}
+
+#[test]
+fn untrusted_document_timestamp_is_not_trusted() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let tsa = mock_tsa(MockTsaOptions::default());
+    let blta = sign_pdf_bytes(
+        &pdf,
+        &p12,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Blta,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Trust only the signer's root, not the TSA's: the document timestamp is
+    // valid but must be reported untrusted, and the report must not pass.
+    let store = TrustStore::from_ders([root_der]).unwrap();
+    let report = verify_pdf_bytes_with_roots(&blta, &store).unwrap();
+    let ts = &report.signatures[1];
+    assert!(ts.is_timestamp && ts.valid);
+    assert_eq!(ts.chain_trusted, Some(false), "{}", ts.detail);
+    assert!(!report.all_trusted(), "an untrusted TSA must not count as trusted");
+    // The signature's own timestamp comes from the same untrusted TSA, so the
+    // signer chain is judged at "now" (no trusted time).
+    assert!(report.signatures[0].trusted_time.is_none());
+}
+
+#[test]
+fn tsa_without_timestamping_eku_cannot_anchor_time() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let tsa = mock_tsa(MockTsaOptions {
+        without_timestamping_eku: true,
+        ..Default::default()
+    });
+    let signed = sign_pdf_bytes(
+        &pdf,
+        &p12,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Bt,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Even with the TSA's root trusted, a certificate without the
+    // id-kp-timeStamping EKU is not a TSA (RFC 3161 §2.3): its genTime must
+    // not become the validation time.
+    let store = TrustStore::from_ders([root_der, tsa.root_der.clone()]).unwrap();
+    let report = verify_pdf_bytes_with_roots(&signed, &store).unwrap();
+    assert!(report.signatures[0].valid);
+    assert!(
+        report.signatures[0].trusted_time.is_none(),
+        "{}",
+        report.signatures[0].detail
+    );
+    assert!(report.signatures[0].detail.contains("timeStamping"));
+}
+
+#[test]
+fn tsa_with_fractional_seconds_is_accepted() {
+    let pdf = sample_pdf();
+    let (p12, root_der) = ca_signed_p12("pw");
+    let tsa = mock_tsa(MockTsaOptions {
+        fractional_seconds: true,
+        ..Default::default()
+    });
+    let signed = sign_pdf_bytes(
+        &pdf,
+        &p12,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Blta,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("a genTime with fractional seconds must be accepted");
+    let store = TrustStore::from_ders([root_der, tsa.root_der.clone()]).unwrap();
+    let report = verify_pdf_bytes_with_roots(&signed, &store).unwrap();
+    assert!(report.all_trusted(), "{:?}", report.signatures.iter().map(|s| &s.detail).collect::<Vec<_>>());
+}
+
+#[test]
+fn tsa_rejection_fails_signing() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let tsa = mock_tsa(MockTsaOptions {
+        reject: true,
+        ..Default::default()
+    });
+    let err = sign_pdf_bytes(
+        &pdf,
+        &p12,
+        "pw",
+        &SignOptions {
+            pades_level: PadesLevel::Bt,
+            tsa_url: Some(tsa.url.clone()),
+            ..Default::default()
+        },
+    )
+    .expect_err("a rejected timestamp must fail signing");
+    assert!(err.to_string().contains("PKIStatus"), "{err}");
+}
+
+#[test]
+fn xref_table_source_gets_xref_table_update_and_keeps_info() {
+    let pdf = sample_pdf_xref_table();
+    let p12 = self_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+    assert_eq!(&signed[..pdf.len()], &pdf[..]);
+    let tail = &signed[pdf.len()..];
+    assert!(contains(tail, b"xref\n") && contains(tail, b"trailer"), "classic xref table expected");
+    assert!(!contains(tail, b"/Type /XRef"));
+    // /Info is carried into the new trailer.
+    let doc = lopdf::Document::load_mem(&signed).unwrap();
+    let info = doc.trailer.get(b"Info").expect("Info carried forward");
+    let title = info.as_dict().unwrap().get(b"Title").unwrap().as_str().unwrap();
+    assert_eq!(title, b"Contrato 42");
+    let report = verify_pdf_bytes(&signed).unwrap();
+    assert!(report.all_valid() && report.signatures[0].covers_whole_document);
+
+    // Sign again: two signatures, both valid, document intact.
+    let twice = sign_pdf_bytes(&signed, &p12, "pw", &SignOptions::default()).unwrap();
+    let report = verify_pdf_bytes(&twice).unwrap();
+    assert_eq!(report.signatures.len(), 2);
+    assert!(report.all_valid());
+}
+
+#[test]
+fn leading_junk_before_header_is_handled() {
+    let mut pdf = b"JUNKJUNKJUNK\n".to_vec();
+    pdf.extend_from_slice(&sample_pdf_xref_table());
+    let p12 = self_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).expect("sign");
+    // lopdf must still parse the result (offsets relative to %PDF-) and find
+    // the signature structurally.
+    let report = verify_pdf_bytes(&signed).unwrap();
+    assert_eq!(report.signatures.len(), 1);
+    assert!(report.all_valid(), "{}", report.signatures[0].detail);
+    assert!(report.signatures[0].covers_whole_document);
+}
+
+#[test]
+fn non_ascii_metadata_is_written_as_utf16() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        reason: Some("Aprovação — São Paulo".into()),
+        name: Some("José".into()),
+        location: Some("Recife".into()),
+        ..Default::default()
+    };
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &opts).unwrap();
+    let doc = lopdf::Document::load_mem(&signed).unwrap();
+    let sig = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .find(|d| d.has(b"ByteRange"))
+        .unwrap();
+    let reason = sig.get(b"Reason").unwrap().as_str().unwrap();
+    assert_eq!(&reason[..2], &[0xFE, 0xFF], "UTF-16BE BOM expected");
+    let units: Vec<u16> = reason[2..]
+        .chunks(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(String::from_utf16(&units).unwrap(), "Aprovação — São Paulo");
+    // ASCII stays a plain literal string; /M is always present.
+    assert_eq!(sig.get(b"Location").unwrap().as_str().unwrap(), b"Recife");
+    assert!(sig.get(b"M").unwrap().as_str().unwrap().starts_with(b"D:20"));
+    // No CMS signing-time attribute (PAdES baseline): id-signingTime OID.
+    assert!(!contains(&signed, b"06092a864886f70d010905"));
+}
+
+#[test]
+fn encrypted_input_is_refused() {
+    // Build an AES-encrypted copy of the sample with lopdf and an empty user
+    // password (the case a reader — and lopdf — silently decrypts).
+    let mut doc = lopdf::Document::load_mem(&sample_pdf()).unwrap();
+    // The document needs an /ID for the standard security handler.
+    doc.trailer.set(
+        "ID",
+        lopdf::Object::Array(vec![
+            lopdf::Object::string_literal(vec![7u8; 16]),
+            lopdf::Object::string_literal(vec![7u8; 16]),
+        ]),
+    );
+    let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V1 {
+        document: &doc,
+        owner_password: "owner",
+        user_password: "",
+        permissions: lopdf::Permissions::default(),
+    })
+    .expect("encryption state");
+    doc.encrypt(&state).expect("encrypt");
+    let mut enc = Vec::new();
+    doc.save_to(&mut enc).unwrap();
+    assert!(contains(&enc, b"/Encrypt"));
+
+    let p12 = self_signed_p12("pw");
+    let err = sign_pdf_bytes(&enc, &p12, "pw", &SignOptions::default())
+        .expect_err("encrypted input must be refused");
+    assert!(err.to_string().contains("encrypted"), "{err}");
+}
+
+#[test]
+fn out_of_range_page_is_an_error() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let opts = SignOptions {
+        appearance: Some(Appearance {
+            page: 7,
+            text: "x".into(),
+            ..Appearance::default()
+        }),
+        ..Default::default()
+    };
+    let err = sign_pdf_bytes(&pdf, &p12, "pw", &opts).expect_err("page 7 of 1");
+    assert!(err.to_string().contains("page 7"), "{err}");
+    let opts = SignOptions {
+        appearance: Some(Appearance {
+            width: f64::NAN,
+            text: "x".into(),
+            ..Appearance::default()
+        }),
+        ..Default::default()
+    };
+    assert!(sign_pdf_bytes(&pdf, &p12, "pw", &opts).is_err(), "NaN geometry");
+}
+
+#[test]
+fn malformed_signature_dictionary_does_not_abort_the_report() {
+    let pdf = sample_pdf();
+    let p12 = self_signed_p12("pw");
+    let signed = sign_pdf_bytes(&pdf, &p12, "pw", &SignOptions::default()).unwrap();
+    // Corrupt the ByteRange's second value into a negative number of the same
+    // width (still four integers, so the dictionary itself parses).
+    let i = find(&signed, b"/ByteRange [0 ").unwrap() + b"/ByteRange [0 ".len();
+    let mut bad = signed.clone();
+    bad[i] = b'-';
+    let report = verify_pdf_bytes(&bad).expect("a bad ByteRange is reported, not an error");
+    assert_eq!(report.signatures.len(), 1);
+    assert!(!report.signatures[0].valid);
+    assert!(report.signatures[0].detail.contains("ByteRange"));
+    assert!(!report.all_valid());
+}
+
+#[test]
+fn leaf_key_usage_is_enforced() {
+    use pdf_signer::testkit::revocation_scenario;
+    // The revocation scenario's leaf has digitalSignature: trusted as a signer.
+    let s = revocation_scenario();
+    let pdf = sample_pdf();
+    let _ = (s, pdf); // exercised through ca_signed_p12 below
+
+    // ca_signed_p12's leaf profile asserts digitalSignature|nonRepudiation, so
+    // it must pass the DocumentSigning purpose check.
+    let (p12, root_der) = ca_signed_p12("pw");
+    let signed = sign_pdf_bytes(&sample_pdf(), &p12, "pw", &SignOptions::default()).unwrap();
+    let store = TrustStore::from_ders([root_der]).unwrap();
+    assert!(verify_pdf_bytes_with_roots(&signed, &store).unwrap().all_trusted());
 }

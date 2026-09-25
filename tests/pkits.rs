@@ -21,10 +21,10 @@ fn pkits_certs_dir() -> Option<PathBuf> {
 #[test]
 #[ignore = "set PKITS_DIR to the extracted NIST PKITS data"]
 fn pkits_policy_conformance() {
-    let Some(certs) = pkits_certs_dir() else {
-        eprintln!("PKITS_DIR not set or invalid; skipping");
-        return;
-    };
+    // This test only runs when explicitly requested (`-- --ignored`), so a
+    // missing data set is a misconfiguration, not a pass.
+    let certs = pkits_certs_dir()
+        .expect("PKITS_DIR must point at the extracted NIST PKITS data (containing certs/)");
 
     let anchor = std::fs::read(certs.join("TrustAnchorRootCertificate.crt")).unwrap();
     let store = TrustStore::from_ders([anchor]).unwrap();
@@ -89,6 +89,7 @@ fn pkits_policy_conformance() {
             pass,
             pass + mismatches.len()
         );
+        assert!(pass > 0, "PKITS {label}: no test certificates found");
         for m in &mismatches {
             eprintln!("{m}");
         }

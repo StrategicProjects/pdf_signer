@@ -713,7 +713,15 @@ pub struct RevocationScenario {
     /// Same contents, but signed by a different key (signature must not verify).
     pub wrong_key_crl: Vec<u8>,
     /// Signed by the root and listing the leaf, but already past `nextUpdate`.
+    /// Revocation is permanent, so this still revokes the leaf.
     pub expired_crl: Vec<u8>,
+    /// Signed by the root, issued (`thisUpdate`) one hour in the **future**,
+    /// listing the leaf as revoked one hour **ago**: evidence produced after
+    /// the validation time that still proves revocation at that time.
+    pub future_crl: Vec<u8>,
+    /// Signed by the root and listing the leaf, but with a `revocationDate`
+    /// one hour in the future: the leaf is *not yet* revoked at "now".
+    pub revoked_later_crl: Vec<u8>,
 }
 
 /// Build a root CA, a leaf, and three CRLs (valid / bad-signature / stale) so
@@ -773,8 +781,9 @@ pub fn revocation_scenario() -> RevocationScenario {
         parameters: None,
     };
 
-    // Build a CRL revoking the leaf, signed by `signer`, valid in [this, next].
-    let build_crl = |signer: &SigningKey<Sha256>, this: u64, next: u64| -> Vec<u8> {
+    // Build a CRL revoking the leaf at `revoked`, signed by `signer`, valid in
+    // [this, next].
+    let build_crl_at = |signer: &SigningKey<Sha256>, this: u64, next: u64, revoked: u64| -> Vec<u8> {
         let tbs = TbsCertList {
             version: Version::V2,
             signature: rsa_sha256(),
@@ -783,7 +792,7 @@ pub fn revocation_scenario() -> RevocationScenario {
             next_update: Some(time(next)),
             revoked_certificates: Some(vec![RevokedCert {
                 serial_number: leaf_serial.clone(),
-                revocation_date: time(this),
+                revocation_date: time(revoked),
                 crl_entry_extensions: None,
             }]),
             crl_extensions: None,
@@ -798,6 +807,9 @@ pub fn revocation_scenario() -> RevocationScenario {
         crl.to_der().unwrap()
     };
 
+    let build_crl = |signer: &SigningKey<Sha256>, this: u64, next: u64| -> Vec<u8> {
+        build_crl_at(signer, this, next, this)
+    };
     let wrong_key = SigningKey::<Sha256>::new(RsaPrivateKey::new(&mut rng, 2048).unwrap());
 
     RevocationScenario {
@@ -806,5 +818,326 @@ pub fn revocation_scenario() -> RevocationScenario {
         good_crl: build_crl(&root_signing, now - 3600, now + 3600),
         wrong_key_crl: build_crl(&wrong_key, now - 3600, now + 3600),
         expired_crl: build_crl(&root_signing, now - 7200, now - 3600),
+        future_crl: build_crl_at(&root_signing, now + 3600, now + 7200, now - 3600),
+        revoked_later_crl: build_crl_at(&root_signing, now - 3600, now + 3600, now + 3600),
     }
+}
+
+/// A minimal one-page PDF that uses a **traditional cross-reference table**
+/// (as `lopdf` now saves xref streams by default, this keeps the xref-table
+/// incremental-update path under test).
+pub fn sample_pdf_xref_table() -> Vec<u8> {
+    let content: &[u8] = b"BT /F1 24 Tf 72 720 Td (xref-table sample) Tj ET";
+    let mut out = Vec::new();
+    let mut off = [0usize; 6];
+    out.extend_from_slice(b"%PDF-1.4\n");
+    off[1] = out.len();
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    off[2] = out.len();
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    off[3] = out.len();
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+    );
+    off[4] = out.len();
+    out.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    out.extend_from_slice(content);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    off[5] = out.len();
+    out.extend_from_slice(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f\r\n");
+    for &o in &off[1..=5] {
+        out.extend_from_slice(format!("{:010} 00000 n\r\n", o).as_bytes());
+    }
+    out.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R /Info << /Title (Contrato 42) >> >>\n");
+    out.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref).as_bytes());
+    out
+}
+
+// --- in-process RFC 3161 TSA ---------------------------------------------------
+
+/// Knobs for [`mock_tsa`].
+#[derive(Debug, Clone, Default)]
+pub struct MockTsaOptions {
+    /// Omit the `id-kp-timeStamping` EKU from the TSA certificate (a
+    /// non-conforming TSA whose tokens must not anchor time).
+    pub without_timestamping_eku: bool,
+    /// Emit `genTime` with fractional seconds (`…SS.123Z`), as many TSAs do.
+    pub fractional_seconds: bool,
+    /// Assert this `genTime` (seconds since the Unix epoch) instead of "now".
+    pub gen_time: Option<u64>,
+    /// Answer with a bogus PKIStatus (rejection) instead of a token.
+    pub reject: bool,
+}
+
+/// A running in-process TSA: POST `TimeStampReq`s to `url`.
+pub struct MockTsa {
+    /// `http://127.0.0.1:<port>/tsa`
+    pub url: String,
+    /// DER of the root CA that issued the TSA certificate (trust it to trust
+    /// the TSA).
+    pub root_der: Vec<u8>,
+    /// DER of the TSA (leaf) certificate.
+    pub tsa_der: Vec<u8>,
+}
+
+/// Start an RFC 3161 TSA on a loopback port in a background thread. It builds
+/// a fresh root CA + TSA certificate (RSA-2048, SHA-256), answers every
+/// well-formed request with a `granted` token over the request's imprint and
+/// nonce, and embeds the TSA certificate. Lives until the process exits.
+pub fn mock_tsa(opts: MockTsaOptions) -> MockTsa {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+
+    let mut rng = rand::thread_rng();
+    let validity = Validity::from_now(Duration::from_secs(365 * 24 * 3600)).unwrap();
+
+    let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let root_signing = SigningKey::<Sha256>::new(root_key);
+    let root_name = Name::from_str("CN=Mock TSA Root,O=pdf_signer tests,C=BR").unwrap();
+    let root_cert = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        root_name.clone(),
+        SubjectPublicKeyInfoOwned::from_key(root_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap()
+    .build::<Signature>()
+    .unwrap();
+    let root_der = root_cert.to_der().unwrap();
+
+    let tsa_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let tsa_signing = SigningKey::<Sha256>::new(tsa_key);
+    let tsa_name = Name::from_str("CN=Mock TSA,O=pdf_signer tests,C=BR").unwrap();
+    let mut builder = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: root_name,
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
+        SerialNumber::from(rand::Rng::gen::<u32>(&mut rng) | 1),
+        validity,
+        tsa_name,
+        SubjectPublicKeyInfoOwned::from_key(tsa_signing.verifying_key()).unwrap(),
+        &root_signing,
+    )
+    .unwrap();
+    if !opts.without_timestamping_eku {
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![
+                const_oid::db::rfc5280::ID_KP_TIME_STAMPING,
+            ]))
+            .unwrap();
+    }
+    let tsa_cert = builder.build::<Signature>().unwrap();
+    let tsa_der = tsa_cert.to_der().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/tsa", listener.local_addr().unwrap());
+    let tsa_cert_thread = tsa_cert.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Read the HTTP request: headers, then Content-Length body bytes.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut body_start: Option<usize> = None;
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    body_start = Some(i + 4);
+                    let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < body_start.unwrap() + len {
+                        let Ok(n) = stream.read(&mut chunk) else { break };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    break;
+                }
+            }
+            let body = body_start.map(|s| &buf[s..]).unwrap_or(&[]);
+            let resp = tsa_response(body, &tsa_signing, &tsa_cert_thread, &opts);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/timestamp-reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(&resp);
+        }
+    });
+
+    MockTsa {
+        url,
+        root_der,
+        tsa_der,
+    }
+}
+
+/// Build the DER `TimeStampResp` for a DER `TimeStampReq`.
+fn tsa_response(
+    req_der: &[u8],
+    signing: &SigningKey<Sha256>,
+    tsa_cert: &x509_cert::Certificate,
+    opts: &MockTsaOptions,
+) -> Vec<u8> {
+    use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
+    use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
+    use cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
+    use der::asn1::{Int, OctetString, SetOfVec};
+    use der::{Any, Decode, Sequence, Tag};
+    use spki::AlgorithmIdentifierOwned;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Sequence)]
+    struct MessageImprint {
+        hash_algorithm: AlgorithmIdentifierOwned,
+        hashed_message: OctetString,
+    }
+    // TimeStampReq with the optional fields we care about.
+    #[derive(Sequence)]
+    struct TimeStampReq {
+        version: i32,
+        message_imprint: MessageImprint,
+        #[asn1(optional = "true")]
+        req_policy: Option<ObjectIdentifier>,
+        #[asn1(optional = "true")]
+        nonce: Option<Int>,
+        #[asn1(default = "Default::default")]
+        cert_req: bool,
+    }
+    #[derive(Sequence)]
+    struct PkiStatusInfo {
+        status: i32,
+    }
+    #[derive(Sequence)]
+    struct TimeStampResp {
+        status: PkiStatusInfo,
+        #[asn1(optional = "true")]
+        token: Option<cms::content_info::ContentInfo>,
+    }
+    // TSTInfo with genTime as a raw GeneralizedTime `Any` (so fractional
+    // seconds can be emitted) and an optional nonce.
+    #[derive(Sequence)]
+    struct TstInfo {
+        version: i32,
+        policy: ObjectIdentifier,
+        message_imprint: MessageImprint,
+        serial_number: Int,
+        gen_time: Any,
+        #[asn1(optional = "true")]
+        nonce: Option<Int>,
+    }
+
+    let rejected = || {
+        TimeStampResp {
+            status: PkiStatusInfo { status: 2 },
+            token: None,
+        }
+        .to_der()
+        .unwrap()
+    };
+    let Ok(req) = TimeStampReq::from_der(req_der) else {
+        return rejected();
+    };
+    if opts.reject {
+        return rejected();
+    }
+
+    let secs = opts.gen_time.unwrap_or_else(|| {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    let dt = der::DateTime::from_unix_duration(Duration::from_secs(secs)).unwrap();
+    let mut gt = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minutes(),
+        dt.seconds()
+    );
+    if opts.fractional_seconds {
+        gt.push_str(".123");
+    }
+    gt.push('Z');
+    let tst = TstInfo {
+        version: 1,
+        policy: ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1"),
+        message_imprint: req.message_imprint,
+        serial_number: Int::new(&[0x01, 0x02, 0x03]).unwrap(),
+        gen_time: Any::new(Tag::GeneralizedTime, gt.as_bytes()).unwrap(),
+        nonce: req.nonce,
+    };
+    let tst_der = tst.to_der().unwrap();
+
+    let encap = EncapsulatedContentInfo {
+        econtent_type: ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4"),
+        econtent: Some(Any::new(Tag::OctetString, tst_der).unwrap()),
+    };
+    let sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+        issuer: tsa_cert.tbs_certificate.issuer.clone(),
+        serial_number: tsa_cert.tbs_certificate.serial_number.clone(),
+    });
+    let sha256 = AlgorithmIdentifierOwned {
+        oid: const_oid::db::rfc5912::ID_SHA_256,
+        parameters: None,
+    };
+    let mut si = SignerInfoBuilder::new(signing, sid, sha256.clone(), &encap, None).unwrap();
+    // ESS signing-certificate-v2 over the TSA certificate.
+    #[derive(Sequence)]
+    struct EssCertIdV2 {
+        cert_hash: OctetString,
+    }
+    #[derive(Sequence)]
+    struct SigningCertificateV2 {
+        certs: Vec<EssCertIdV2>,
+    }
+    let scv2 = SigningCertificateV2 {
+        certs: vec![EssCertIdV2 {
+            cert_hash: OctetString::new(
+                <Sha256 as sha2::Digest>::digest(tsa_cert.to_der().unwrap()).to_vec(),
+            )
+            .unwrap(),
+        }],
+    };
+    let mut values = SetOfVec::new();
+    values.insert(Any::encode_from(&scv2).unwrap()).unwrap();
+    si.add_signed_attribute(x509_cert::attr::Attribute {
+        oid: const_oid::db::rfc5911::ID_AA_SIGNING_CERTIFICATE_V_2,
+        values,
+    })
+    .unwrap();
+    let mut builder = SignedDataBuilder::new(&encap);
+    builder.add_digest_algorithm(sha256).unwrap();
+    builder
+        .add_certificate(CertificateChoices::Certificate(tsa_cert.clone()))
+        .unwrap();
+    let token = builder
+        .add_signer_info::<SigningKey<Sha256>, Signature>(si)
+        .unwrap()
+        .build()
+        .unwrap();
+    TimeStampResp {
+        status: PkiStatusInfo { status: 0 },
+        token: Some(token),
+    }
+    .to_der()
+    .unwrap()
 }

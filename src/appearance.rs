@@ -58,16 +58,20 @@ pub(crate) fn add_appearance(
         let img = decode_image(bytes)?;
         let smask_ref = img.smask.as_ref().map(|sm| {
             let sid = alloc();
-            inc.add(sid, image_stream(img.width, img.height, b"DeviceGray", b"FlateDecode", sm.clone(), None));
+            inc.add(sid, image_stream(img.width, img.height, b"DeviceGray", b"FlateDecode", sm.clone(), None, false));
             sid
         });
         let img_id = alloc();
         inc.add(
             img_id,
-            image_stream(img.width, img.height, img.color_space, img.filter, img.data, smask_ref),
+            image_stream(img.width, img.height, img.color_space, img.filter, img.data, smask_ref, img.inverted),
         );
-        let h = app.height - 4.0;
-        let rect = app.image_rect.unwrap_or([2.0, 2.0, h.min(app.width - 4.0), h]);
+        // Default placement: left edge, fitted to the box height, aspect ratio
+        // preserved, never wider than a third of the box.
+        let h = (app.height - 4.0).max(1.0);
+        let aspect = if img.height > 0 { img.width as f64 / img.height as f64 } else { 1.0 };
+        let w = (h * aspect).min((app.width / 3.0).max(1.0));
+        let rect = app.image_rect.unwrap_or([2.0, 2.0, w, h]);
         image = Some((img_id, rect));
     }
 
@@ -115,7 +119,15 @@ fn build_embedded_font(
     descriptor_id: ObjectId,
     fontfile_id: ObjectId,
 ) -> Result<(Object, Object, Object)> {
+    if ttf_parser::fonts_in_collection(bytes).is_some() {
+        return Err(Error::Malformed(
+            "TrueType collections (.ttc) are not supported; extract a single face".into(),
+        ));
+    }
     let face = ttf_parser::Face::parse(bytes, 0).map_err(err)?;
+    // A CFF-flavoured OpenType font ("OTTO") is not a TrueType program: it must
+    // be embedded as /FontFile3 /Subtype /OpenType, not /FontFile2.
+    let is_cff = face.tables().cff.is_some() || bytes.starts_with(b"OTTO");
     let upem = face.units_per_em() as f64;
     let scale = 1000.0 / upem;
 
@@ -157,11 +169,19 @@ fn build_embedded_font(
         ),
     );
     descriptor.set("StemV", Object::Integer(80));
-    descriptor.set("FontFile2", Object::Reference(fontfile_id));
+    descriptor.set(
+        if is_cff { "FontFile3" } else { "FontFile2" },
+        Object::Reference(fontfile_id),
+    );
 
-    // The font program, FlateDecode'd, with /Length1 = uncompressed size.
+    // The font program, FlateDecode'd. TrueType: /Length1 = uncompressed size;
+    // CFF OpenType: /Subtype /OpenType.
     let mut ff_dict = Dictionary::new();
-    ff_dict.set("Length1", Object::Integer(bytes.len() as i64));
+    if is_cff {
+        ff_dict.set("Subtype", name(b"OpenType"));
+    } else {
+        ff_dict.set("Length1", Object::Integer(bytes.len() as i64));
+    }
     ff_dict.set("Filter", name(b"FlateDecode"));
     let fontfile = Object::Stream(Stream::new(ff_dict, zlib_compress(bytes)));
 
@@ -187,6 +207,25 @@ struct EmbeddedImage {
     filter: &'static [u8],
     data: Vec<u8>,
     smask: Option<Vec<u8>>, // FlateDecode'd grayscale alpha
+    /// Samples are stored inverted (Adobe CMYK JPEG): emit `/Decode [1 0 …]`.
+    inverted: bool,
+}
+
+/// True if the JPEG carries an Adobe APP14 marker segment.
+fn has_adobe_app14(bytes: &[u8]) -> bool {
+    let mut i = 2;
+    while i + 4 <= bytes.len() && bytes[i] == 0xFF {
+        let marker = bytes[i + 1];
+        if marker == 0xDA {
+            break; // start of scan
+        }
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if marker == 0xEE && bytes.get(i + 4..i + 9) == Some(b"Adobe") {
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
 }
 
 fn decode_image(bytes: &[u8]) -> Result<EmbeddedImage> {
@@ -213,7 +252,11 @@ fn decode_jpeg(bytes: &[u8]) -> Result<EmbeddedImage> {
             let height = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
             let width = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
             let components = bytes[i + 9];
-            let cs: &[u8] = if components == 1 { b"DeviceGray" } else { b"DeviceRGB" };
+            let cs: &[u8] = match components {
+                1 => b"DeviceGray",
+                4 => b"DeviceCMYK",
+                _ => b"DeviceRGB",
+            };
             return Ok(EmbeddedImage {
                 width,
                 height,
@@ -221,6 +264,8 @@ fn decode_jpeg(bytes: &[u8]) -> Result<EmbeddedImage> {
                 filter: b"DCTDecode",
                 data: bytes.to_vec(),
                 smask: None,
+                // Adobe APP14 CMYK JPEGs store inverted samples.
+                inverted: components == 4 && has_adobe_app14(bytes),
             });
         }
         // Skip this segment using its length.
@@ -280,9 +325,11 @@ fn decode_png(bytes: &[u8]) -> Result<EmbeddedImage> {
         filter: b"FlateDecode",
         data: zlib_compress(&color),
         smask: alpha.map(|a| zlib_compress(&a)),
+        inverted: false,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn image_stream(
     width: u32,
     height: u32,
@@ -290,6 +337,7 @@ fn image_stream(
     filter: &[u8],
     data: Vec<u8>,
     smask: Option<ObjectId>,
+    inverted: bool,
 ) -> Object {
     let mut d = Dictionary::new();
     d.set("Type", name(b"XObject"));
@@ -302,6 +350,16 @@ fn image_stream(
     if let Some(sm) = smask {
         d.set("SMask", Object::Reference(sm));
     }
+    if inverted {
+        d.set(
+            "Decode",
+            Object::Array(
+                std::iter::repeat_n([Object::Integer(1), Object::Integer(0)], 4)
+                    .flatten()
+                    .collect(),
+            ),
+        );
+    }
     Object::Stream(Stream::new(d, data))
 }
 
@@ -312,7 +370,12 @@ fn build_content(app: &Appearance, font_name: &[u8], image: Option<[f64; 4]>) ->
     let margin = 2.0_f64;
     let fs = app.font_size;
     let leading = fs * 1.2;
-    let max_w = (app.width - 2.0 * margin).max(1.0);
+    // With a logo on the left, the text column starts to its right.
+    let text_x = match image {
+        Some([ix, _, iw, _]) if ix + iw < app.width / 2.0 => ix + iw + margin,
+        _ => margin,
+    };
+    let max_w = (app.width - text_x - margin).max(1.0);
     let lines = wrap_text(&app.text, max_w, fs);
     let start_y = app.height - margin - fs;
 
@@ -340,7 +403,7 @@ fn build_content(app: &Appearance, font_name: &[u8], image: Option<[f64; 4]>) ->
     out.extend_from_slice(font_name);
     out.extend_from_slice(format!(" {:.2} Tf\n", fs).as_bytes());
     out.extend_from_slice(format!("{:.2} TL\n", leading).as_bytes());
-    out.extend_from_slice(format!("{:.2} {:.2} Td\n", margin, start_y).as_bytes());
+    out.extend_from_slice(format!("{:.2} {:.2} Td\n", text_x, start_y).as_bytes());
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
             out.extend_from_slice(b"T* ");

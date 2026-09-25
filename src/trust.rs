@@ -13,32 +13,46 @@
 //!
 //! Revocation: CRL and OCSP material (collected into the `/DSS`) is
 //! authenticated before it is acted on — a CRL must be in scope and signed by
-//! the issuing CA and current; an OCSP response must be signed by the issuer or
-//! a delegated `id-kp-OCSPSigning` responder and current. Revocation is
+//! the issuing CA; an OCSP response must be signed by the issuer or a delegated
+//! `id-kp-OCSPSigning` responder. An authenticated *revoked* entry counts
+//! whenever its revocation date is not after the validation time, even if the
+//! evidence itself was produced later (RFC 3161 Appendix B). Revocation is
 //! soft-fail (no usable evidence ⇒ not treated as revoked). Not yet covered:
 //! IDP / partitioned CRLs and a hard-fail mode.
+//!
+//! Every certificate below the trust anchor must also pass RFC 5280 §6.1.3
+//! extension processing: a critical extension this crate does not understand,
+//! or a known extension that fails to decode (including duplicates), fails the
+//! path rather than being ignored.
 
 use std::time::SystemTime;
 
 use const_oid::db::rfc5912::{
     ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, ID_KP_OCSP_SIGNING,
-    SHA_256_WITH_RSA_ENCRYPTION, SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
+    ID_KP_TIME_STAMPING, SHA_256_WITH_RSA_ENCRYPTION, SHA_384_WITH_RSA_ENCRYPTION,
+    SHA_512_WITH_RSA_ENCRYPTION,
 };
 use const_oid::db::rfc8410::ID_ED_25519;
 use der::{Decode, Encode};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::RsaPublicKey;
 use sha2::{Sha256, Sha384, Sha512};
+use signature::hazmat::PrehashVerifier;
 use signature::Verifier;
 use spki::DecodePublicKey;
 use std::collections::BTreeSet;
 
 use const_oid::db::rfc5280::ANY_POLICY;
+use const_oid::db::rfc5912::{
+    ID_SHA_1, ID_SHA_256, ID_SHA_384, ID_SHA_512,
+};
 use const_oid::ObjectIdentifier;
 use sha1::{Digest as _, Sha1};
 use x509_cert::crl::CertificateList;
 use x509_cert::ext::pkix::name::GeneralName;
-use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, NameConstraints, SubjectAltName};
+use x509_cert::ext::pkix::{
+    BasicConstraints, ExtendedKeyUsage, KeyUsage, NameConstraints, SubjectAltName,
+};
 use x509_cert::name::{Name, RelativeDistinguishedName};
 use x509_cert::Certificate;
 use x509_ocsp::{BasicOcspResponse, CertId, CertStatus, ResponderId};
@@ -48,6 +62,118 @@ use crate::policy::{process_policies, PolicyInput};
 use crate::Result;
 
 const MAX_DEPTH: usize = 10;
+
+/// Upper bound on the number of candidate-issuer evaluations (each costing a
+/// signature verification) a single path search may perform. The candidate
+/// pool comes from the untrusted CMS, and without a budget a handful of
+/// same-name CA certificates makes the backtracking search factorial.
+const MAX_CANDIDATE_EVALUATIONS: usize = 256;
+
+/// What the end-entity certificate of a path is being used for. Drives the
+/// leaf `keyUsage` / `extendedKeyUsage` checks (RFC 5280 §4.2.1.3 / §4.2.1.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeafPurpose {
+    /// No purpose-specific leaf checks (e.g. NIST PKITS conformance runs).
+    Any,
+    /// A document signer: `digitalSignature` or `nonRepudiation` when
+    /// `keyUsage` is present.
+    DocumentSigning,
+    /// An RFC 3161 TSA: the `id-kp-timeStamping` extended key usage is
+    /// **required** (RFC 3161 §2.3), plus `digitalSignature`/`nonRepudiation`
+    /// when `keyUsage` is present.
+    TimeStamping,
+}
+
+/// Extensions this validator knows how to process. Any *other* extension that
+/// a certificate marks critical fails path validation (RFC 5280 §6.1.3 (b)).
+const RECOGNIZED_EXTENSIONS: &[ObjectIdentifier] = &[
+    const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS,
+    const_oid::db::rfc5280::ID_CE_KEY_USAGE,
+    const_oid::db::rfc5280::ID_CE_EXT_KEY_USAGE,
+    const_oid::db::rfc5280::ID_CE_NAME_CONSTRAINTS,
+    const_oid::db::rfc5280::ID_CE_CERTIFICATE_POLICIES,
+    const_oid::db::rfc5280::ID_CE_POLICY_MAPPINGS,
+    const_oid::db::rfc5280::ID_CE_POLICY_CONSTRAINTS,
+    const_oid::db::rfc5280::ID_CE_INHIBIT_ANY_POLICY,
+    const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME,
+    const_oid::db::rfc5280::ID_CE_ISSUER_ALT_NAME,
+    const_oid::db::rfc5280::ID_CE_SUBJECT_KEY_IDENTIFIER,
+    const_oid::db::rfc5280::ID_CE_AUTHORITY_KEY_IDENTIFIER,
+    const_oid::db::rfc5280::ID_CE_CRL_DISTRIBUTION_POINTS,
+    const_oid::db::rfc5280::ID_CE_FRESHEST_CRL,
+    const_oid::db::rfc5280::ID_CE_SUBJECT_DIRECTORY_ATTRIBUTES,
+    const_oid::db::rfc5280::ID_PE_AUTHORITY_INFO_ACCESS,
+    const_oid::db::rfc5280::ID_PE_SUBJECT_INFO_ACCESS,
+    // id-pkix-ocsp-nocheck (RFC 6960 §4.2.2.2.1), seen on OCSP responder certs.
+    const_oid::db::rfc6960::ID_PKIX_OCSP_NOCHECK,
+];
+
+/// Decode extension `T` of `cert` strictly: `Ok(None)` when absent, `Ok(Some)`
+/// when present and well-formed, `Err` when present but undecodable — which
+/// includes a duplicated extension (x509-cert reports duplicates as an error).
+/// Callers treat `Err` as a validation failure, never as "absent".
+fn ext<'a, T: Decode<'a> + const_oid::AssociatedOid>(
+    cert: &'a Certificate,
+) -> std::result::Result<Option<T>, String> {
+    match cert.tbs_certificate.get::<T>() {
+        Ok(Some((_, v))) => Ok(Some(v)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!("malformed or duplicated certificate extension: {e}")),
+    }
+}
+
+/// RFC 5280 §6.1.3 (b)/(c) extension processing for one certificate below the
+/// anchor: every known extension must decode, and no unknown extension may be
+/// critical.
+fn check_extensions(cert: &Certificate) -> std::result::Result<(), String> {
+    if let Some(exts) = &cert.tbs_certificate.extensions {
+        for e in exts {
+            if e.critical && !RECOGNIZED_EXTENSIONS.contains(&e.extn_id) {
+                return Err(format!(
+                    "unrecognized critical certificate extension {}",
+                    e.extn_id
+                ));
+            }
+        }
+    }
+    ext::<BasicConstraints>(cert)?;
+    ext::<KeyUsage>(cert)?;
+    ext::<ExtendedKeyUsage>(cert)?;
+    ext::<NameConstraints>(cert)?;
+    ext::<SubjectAltName>(cert)?;
+    ext::<x509_cert::ext::pkix::CertificatePolicies>(cert)?;
+    ext::<x509_cert::ext::pkix::PolicyMappings>(cert)?;
+    ext::<x509_cert::ext::pkix::PolicyConstraints>(cert)?;
+    ext::<x509_cert::ext::pkix::InhibitAnyPolicy>(cert)?;
+    Ok(())
+}
+
+/// Leaf key-usage checks for `purpose` (RFC 5280 §4.2.1.3, RFC 3161 §2.3).
+fn check_leaf_purpose(leaf: &Certificate, purpose: LeafPurpose) -> std::result::Result<(), String> {
+    if purpose == LeafPurpose::Any {
+        return Ok(());
+    }
+    if let Some(ku) = ext::<KeyUsage>(leaf)? {
+        if !(ku.digital_signature() || ku.non_repudiation()) {
+            return Err(
+                "signer certificate keyUsage permits neither digitalSignature nor nonRepudiation"
+                    .into(),
+            );
+        }
+    }
+    if purpose == LeafPurpose::TimeStamping {
+        match ext::<ExtendedKeyUsage>(leaf)? {
+            Some(eku) if eku.0.contains(&ID_KP_TIME_STAMPING) => {}
+            _ => {
+                return Err(
+                    "TSA certificate lacks the id-kp-timeStamping extended key usage (RFC 3161 §2.3)"
+                        .into(),
+                )
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A set of trusted root certificates (e.g. the ICP-Brasil AC Raiz set), plus
 /// optional validation parameters.
@@ -85,10 +211,10 @@ impl TrustStore {
     }
 
     /// Require that the certificate path asserts a given policy OID (e.g. an
-    /// ICP-Brasil policy). Validation then fails unless the leaf — and every
-    /// intermediate that carries a policies extension — asserts it (or
-    /// `anyPolicy`). This is a practical subset of RFC 5280 §6.1 policy
-    /// processing (no policy mapping / `valid_policy_tree`).
+    /// ICP-Brasil policy): the OID becomes the `user-initial-policy-set` and
+    /// `initial-explicit-policy` is set, so the RFC 5280 §6.1 policy engine
+    /// (`valid_policy_tree`, policy mapping, the inhibit/require counters) must
+    /// end with that policy valid for the leaf.
     pub fn require_policy(mut self, oid: &str) -> Result<Self> {
         self.required_policy =
             Some(ObjectIdentifier::new(oid).map_err(|e| Error::Crypto(e.to_string()))?);
@@ -115,17 +241,18 @@ pub(crate) struct ChainResult {
 /// embedded in the CMS) as candidate intermediates, at time `at`. `crls` are
 /// the revocation lists available (e.g. from the document's DSS).
 ///
-/// Enforces, per RFC 5280 (practical subset): each link's signature, validity
-/// windows, issuer `basicConstraints` CA flag, `pathLenConstraint`,
-/// `keyCertSign` key usage, CRL + OCSP revocation, **name constraints**, and an
-/// optional **required policy** OID. Not enforced: the full policy
-/// `valid_policy_tree` / policy mapping.
+/// Enforces, per RFC 5280: each link's signature, validity windows, issuer
+/// `basicConstraints` CA flag, `pathLenConstraint` (non-self-issued
+/// intermediates), `keyCertSign` key usage, critical-extension processing,
+/// CRL + OCSP revocation, **name constraints**, the §6.1 **policy engine**
+/// (with an optional required policy), and the leaf's key usage for
+/// `purpose`. The search is bounded by [`MAX_CANDIDATE_EVALUATIONS`].
 ///
 /// Revocation is **soft-fail**: a CRL or OCSP response is only acted on once it
-/// is authenticated (signed by the issuing CA / an authorized responder), in
-/// scope, and current; when no such evidence is available a certificate is not
-/// treated as revoked. This avoids a forged or stale list silently flipping the
-/// verdict, while not requiring online revocation material to be present.
+/// is authenticated (signed by the issuing CA / an authorized responder) and in
+/// scope; when no such evidence is available a certificate is not treated as
+/// revoked. This avoids a forged list silently flipping the verdict, while not
+/// requiring online revocation material to be present.
 pub(crate) fn verify_chain(
     leaf: &Certificate,
     pool: &[Certificate],
@@ -133,83 +260,149 @@ pub(crate) fn verify_chain(
     crls: &[CertificateList],
     ocsps: &[BasicOcspResponse],
     at: SystemTime,
+    purpose: LeafPurpose,
 ) -> ChainResult {
     let at = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
+    // The leaf's own extensions and purpose are checked once, up front (they do
+    // not depend on which issuer path is taken).
+    if !store.roots.iter().any(|r| same_cert(r, leaf)) {
+        if let Err(detail) = check_extensions(leaf) {
+            return fail(&detail);
+        }
+    }
+    if let Err(detail) = check_leaf_purpose(leaf, purpose) {
+        return fail(&detail);
+    }
+
+    // Deduplicate the candidate pool (the CMS may carry the same certificate
+    // several times) so identical candidates are not re-evaluated.
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let pool: Vec<&Certificate> = pool
+        .iter()
+        .filter(|c| c.to_der().map(|d| seen.insert(d)).unwrap_or(false))
+        .collect();
+
     // Build [leaf, intermediate..., root] depth-first, backtracking past any
     // candidate issuer that fails its checks so a valid alternative chain — e.g.
     // under cross-signing, duplicate intermediates, or a candidate that trips a
     // constraint — can still be found rather than abandoned.
+    let mut ctx = SearchCtx {
+        store,
+        pool: &pool,
+        crls,
+        ocsps,
+        at,
+        budget: MAX_CANDIDATE_EVALUATIONS,
+    };
     let mut path: Vec<Certificate> = vec![leaf.clone()];
-    extend_path(&mut path, store, pool, crls, ocsps, at, 0)
+    extend_path(&mut path, &mut ctx)
+}
+
+/// Shared, read-mostly state of one path search plus its remaining budget.
+struct SearchCtx<'a> {
+    store: &'a TrustStore,
+    pool: &'a [&'a Certificate],
+    crls: &'a [CertificateList],
+    ocsps: &'a [BasicOcspResponse],
+    at: i64,
+    /// Remaining candidate-issuer evaluations (see [`MAX_CANDIDATE_EVALUATIONS`]).
+    budget: usize,
+}
+
+impl SearchCtx<'_> {
+    /// Spend one unit of budget; `false` once exhausted.
+    fn spend(&mut self) -> bool {
+        if self.budget == 0 {
+            return false;
+        }
+        self.budget -= 1;
+        true
+    }
 }
 
 /// Depth-first certificate-path construction with backtracking. `path` ends at
 /// the certificate we are trying to chain upward to a trusted root. Returns the
 /// first fully validated [`ChainResult`], else a failure. Each candidate issuer
 /// is evaluated independently: a rejected candidate is skipped, not fatal, so a
-/// later valid issuer still gets its turn.
-#[allow(clippy::too_many_arguments)]
-fn extend_path(
-    path: &mut Vec<Certificate>,
-    store: &TrustStore,
-    pool: &[Certificate],
-    crls: &[CertificateList],
-    ocsps: &[BasicOcspResponse],
-    at: i64,
-    intermediates: usize,
-) -> ChainResult {
+/// later valid issuer still gets its turn. The search stops once the
+/// evaluation budget is exhausted (an attacker-supplied pool must not be able to
+/// make verification run for hours).
+fn extend_path(path: &mut Vec<Certificate>, ctx: &mut SearchCtx<'_>) -> ChainResult {
     let current = path.last().unwrap().clone();
+    let at = ctx.at;
     if !valid_at(&current, at) {
         return fail("a certificate in the path is expired or not yet valid");
     }
     // The current certificate is itself a trusted anchor.
-    if store.roots.iter().any(|r| same_cert(r, &current)) {
-        return finalize(path, store, at);
+    if ctx.store.roots.iter().any(|r| same_cert(r, &current)) {
+        return finalize(path, ctx.store);
     }
     // The most informative rejection seen so far (a path that reached a root but
     // failed a path-wide check beats the generic "no path" message).
     let mut pending: Option<ChainResult> = None;
 
     // Try every trusted root that could have issued `current`.
-    for root in store.roots.iter().filter(|r| issued_by(&current, r)) {
-        if !valid_at(root, at) || revoked(&current, root, crls, ocsps, at) {
+    for root in ctx.store.roots.iter() {
+        if !ctx.spend() {
+            return pending.unwrap_or_else(|| fail("certificate path search budget exhausted"));
+        }
+        if !issued_by(&current, root) {
+            continue;
+        }
+        if !valid_at(root, at) || revoked(&current, root, ctx.crls, ctx.ocsps, at) {
             continue;
         }
         path.push(root.clone());
-        let result = finalize(path, store, at);
+        let result = finalize(path, ctx.store);
         if result.trusted {
             return result;
         }
         pending.get_or_insert(result);
         path.pop();
     }
+    // Intermediates already on the path (everything but the leaf).
+    let intermediates = path.len() - 1;
     if intermediates >= MAX_DEPTH {
         return pending.unwrap_or_else(|| fail("certificate path too long"));
     }
+    // RFC 5280 §4.2.1.9: pathLenConstraint bounds the number of **non-self-issued**
+    // intermediate certificates that may follow the constrained CA.
+    let counted_below = path[1..]
+        .iter()
+        .filter(|c| !crate::policy::is_self_issued(c))
+        .count();
     // Try every candidate intermediate that could have issued `current`.
-    for next in pool.iter() {
+    for &next in ctx.pool.iter() {
         // Skip self and anything already on the path (avoid cycles).
         if same_cert(next, &current) || path.iter().any(|c| same_cert(c, next)) {
             continue;
         }
+        if !ctx.spend() {
+            return pending.unwrap_or_else(|| fail("certificate path search budget exhausted"));
+        }
         if !issued_by(&current, next) {
             continue;
         }
-        // Must be a CA whose pathLenConstraint still permits the certificates
-        // below it, assert keyCertSign, and not be revoked by its issuer.
+        // RFC 5280 §6.1.3 extension processing, then: must be a CA whose
+        // pathLenConstraint still permits the certificates below it, assert
+        // keyCertSign, and not be revoked by its issuer.
+        if let Err(detail) = check_extensions(next) {
+            pending.get_or_insert(fail(&detail));
+            continue;
+        }
         match ca_constraints(next) {
-            Some((true, path_len)) if !path_len.is_some_and(|n| (n as usize) < intermediates) => {}
+            Some((true, path_len)) if !path_len.is_some_and(|n| (n as usize) < counted_below) => {}
             _ => continue,
         }
-        if !permits_cert_sign(next) || revoked(&current, next, crls, ocsps, at) {
+        if !permits_cert_sign(next) || revoked(&current, next, ctx.crls, ctx.ocsps, at) {
             continue;
         }
         path.push(next.clone());
-        let result = extend_path(path, store, pool, crls, ocsps, at, intermediates + 1);
+        let result = extend_path(path, ctx);
         if result.trusted {
             return result;
         }
@@ -221,7 +414,7 @@ fn extend_path(
 
 /// Run the path-wide checks (name constraints, required policy) once a trusted
 /// root has been reached. `path` is `[leaf, intermediate..., root]`.
-fn finalize(path: &[Certificate], store: &TrustStore, _at: i64) -> ChainResult {
+fn finalize(path: &[Certificate], store: &TrustStore) -> ChainResult {
     if let Err(detail) = check_name_constraints(path) {
         return fail(&detail);
     }
@@ -437,29 +630,36 @@ fn uri_host(uri: &str) -> &str {
 
 
 /// True if an **authenticated** OCSP response marks `cert` (under `issuer`) as
-/// revoked. The response must be signed either by the issuer itself or by a
-/// delegated responder it certified (with the `id-kp-OCSPSigning` EKU), and the
-/// matching single response must be current. Unauthenticated or stale responses
-/// are ignored (soft-fail, see [`revoked`]).
+/// revoked at or before `at`. The response must be signed either by the issuer
+/// itself or by a delegated responder it certified (with the `id-kp-OCSPSigning`
+/// EKU) that is valid at `at`. Unauthenticated responses are ignored (soft-fail,
+/// see [`revoked`]). Revocation is permanent, so a *revoked* single response
+/// counts whenever its `revocationTime` is not after `at` — even if the
+/// response itself was produced later than `at` (RFC 3161 Appendix B): the
+/// OCSP evidence a B-LT signer embeds is necessarily fetched after signing.
 fn ocsp_revoked(
     cert: &Certificate,
     issuer: &Certificate,
     ocsps: &[BasicOcspResponse],
     at: i64,
 ) -> bool {
-    let Ok(want) = CertId::from_issuer::<Sha1>(issuer, cert.tbs_certificate.serial_number.clone())
-    else {
-        return false;
-    };
     for basic in ocsps {
-        if !ocsp_authentic(basic, issuer) {
+        if !ocsp_authentic(basic, issuer, at) {
             continue;
         }
         for single in basic.tbs_response_data.responses.iter() {
-            if cert_id_eq(&single.cert_id, &want)
-                && matches!(single.cert_status, CertStatus::Revoked(_))
-                && ocsp_single_current(single, at)
-            {
+            let CertStatus::Revoked(info) = &single.cert_status else {
+                continue;
+            };
+            // Recompute the CertID under the hash the responder used.
+            let Some(want) = cert_id_for(&single.cert_id.hash_algorithm.oid, issuer, cert) else {
+                continue;
+            };
+            if !cert_id_eq(&single.cert_id, &want) {
+                continue;
+            }
+            let revoked_at = info.revocation_time.0.to_unix_duration().as_secs() as i64;
+            if revoked_at <= at {
                 return true;
             }
         }
@@ -467,10 +667,27 @@ fn ocsp_revoked(
     false
 }
 
+/// The `CertID` of `cert` under `issuer`, hashed with the algorithm `oid`
+/// (SHA-1 / SHA-256 / SHA-384 / SHA-512, as responders use in practice).
+fn cert_id_for(oid: &ObjectIdentifier, issuer: &Certificate, cert: &Certificate) -> Option<CertId> {
+    let serial = cert.tbs_certificate.serial_number.clone();
+    if *oid == ID_SHA_1 {
+        CertId::from_issuer::<Sha1>(issuer, serial).ok()
+    } else if *oid == ID_SHA_256 {
+        CertId::from_issuer::<Sha256>(issuer, serial).ok()
+    } else if *oid == ID_SHA_384 {
+        CertId::from_issuer::<Sha384>(issuer, serial).ok()
+    } else if *oid == ID_SHA_512 {
+        CertId::from_issuer::<Sha512>(issuer, serial).ok()
+    } else {
+        None
+    }
+}
+
 /// Verify that a `BasicOcspResponse` is signed by an authorized responder for
 /// `issuer`: either `issuer` directly, or a delegated responder certificate
 /// embedded in the response, issued by `issuer` and bearing the OCSP-signing EKU.
-fn ocsp_authentic(basic: &BasicOcspResponse, issuer: &Certificate) -> bool {
+fn ocsp_authentic(basic: &BasicOcspResponse, issuer: &Certificate, at: i64) -> bool {
     let Ok(tbs) = basic.tbs_response_data.to_der() else {
         return false;
     };
@@ -490,6 +707,8 @@ fn ocsp_authentic(basic: &BasicOcspResponse, issuer: &Certificate) -> bool {
             if responder_is(rid, c)
                 && issued_by(c, issuer)
                 && has_ocsp_signing_eku(c)
+                && valid_at(c, at)
+                && check_extensions(c).is_ok()
                 && verify_with_cert(c, &tbs, oid, sig)
             {
                 return true;
@@ -533,17 +752,6 @@ fn has_ocsp_signing_eku(cert: &Certificate) -> bool {
         cert.tbs_certificate.get::<ExtendedKeyUsage>(),
         Ok(Some((_, eku))) if eku.0.contains(&ID_KP_OCSP_SIGNING)
     )
-}
-
-/// True if `at` falls within the single response's `thisUpdate..nextUpdate`.
-fn ocsp_single_current(single: &x509_ocsp::SingleResponse, at: i64) -> bool {
-    if at < single.this_update.0.to_unix_duration().as_secs() as i64 {
-        return false;
-    }
-    match &single.next_update {
-        Some(nu) => at <= nu.0.to_unix_duration().as_secs() as i64,
-        None => true,
-    }
 }
 
 /// Compare two `CertID`s by name hash, key hash and serial (ignoring the hash
@@ -597,14 +805,17 @@ fn revoked(
     crl_revoked(cert, issuer, crls, at) || ocsp_revoked(cert, issuer, ocsps, at)
 }
 
-/// True if an **authenticated** CRL from `issuer` lists `cert` as revoked.
+/// True if an **authenticated** CRL from `issuer` lists `cert` as revoked at or
+/// before `at`.
 ///
-/// A CRL is only consulted when it is in scope (issued by this CA), its
-/// signature verifies under the CA's key, and it is currently within its
-/// `thisUpdate..nextUpdate` window. Unauthenticated, out-of-scope or stale CRLs
-/// are ignored rather than trusted (revocation is otherwise soft-fail: absence
-/// of usable revocation data does not by itself make a certificate untrusted —
-/// see [`verify_chain`]).
+/// A CRL is only consulted when it is in scope (issued by this CA) and its
+/// signature verifies under the CA's key. Revocation is permanent, so an entry
+/// whose `revocationDate` is not after `at` counts regardless of the CRL's own
+/// `thisUpdate`/`nextUpdate` window: a CRL published *after* a trusted signing
+/// time is exactly the evidence that shows the certificate was already revoked
+/// at that time (RFC 3161 Appendix B), and a stale CRL does not un-revoke
+/// anything. Unauthenticated or out-of-scope CRLs are ignored rather than
+/// trusted (revocation is otherwise soft-fail — see [`verify_chain`]).
 fn crl_revoked(cert: &Certificate, issuer: &Certificate, crls: &[CertificateList], at: i64) -> bool {
     let serial = cert.tbs_certificate.serial_number.to_der().ok();
     let ca_subject = issuer.tbs_certificate.subject.to_der().ok();
@@ -617,15 +828,11 @@ fn crl_revoked(cert: &Certificate, issuer: &Certificate, crls: &[CertificateList
         if !verify_crl_signature(crl, issuer) {
             continue;
         }
-        // Freshness: thisUpdate <= at <= nextUpdate (when present).
-        if !crl_current(crl, at) {
-            continue;
-        }
         if let Some(revoked) = &crl.tbs_cert_list.revoked_certificates {
-            if revoked
-                .iter()
-                .any(|entry| entry.serial_number.to_der().ok() == serial)
-            {
+            if revoked.iter().any(|entry| {
+                entry.serial_number.to_der().ok() == serial
+                    && time_secs(&entry.revocation_date) <= at
+            }) {
                 return true;
             }
         }
@@ -644,20 +851,11 @@ fn verify_crl_signature(crl: &CertificateList, issuer: &Certificate) -> bool {
     let Ok(spki) = issuer.tbs_certificate.subject_public_key_info.to_der() else {
         return false;
     };
-    verify_signature(&tbs, crl.signature_algorithm.oid, sig, &spki)
-}
-
-/// True if `at` falls within the CRL's `thisUpdate..nextUpdate` validity window.
-/// A CRL without `nextUpdate` is treated as not-yet-stale (only `thisUpdate` is
-/// enforced).
-fn crl_current(crl: &CertificateList, at: i64) -> bool {
-    if at < time_secs(&crl.tbs_cert_list.this_update) {
+    // RFC 5280 §5.1.1.2: the outer signatureAlgorithm must equal the TBS one.
+    if crl.signature_algorithm != crl.tbs_cert_list.signature {
         return false;
     }
-    match &crl.tbs_cert_list.next_update {
-        Some(nu) => at <= time_secs(nu),
-        None => true,
-    }
+    verify_signature(&tbs, crl.signature_algorithm.oid, sig, &spki)
 }
 
 /// `child` is issued by `issuer`: issuer/subject names match and the issuer's
@@ -681,6 +879,10 @@ fn verify_cert_signature(child: &Certificate, issuer: &Certificate) -> bool {
     let Ok(spki) = issuer.tbs_certificate.subject_public_key_info.to_der() else {
         return false;
     };
+    // RFC 5280 §4.1.1.2: the outer signatureAlgorithm must equal the TBS one.
+    if child.signature_algorithm != child.tbs_certificate.signature {
+        return false;
+    }
     verify_signature(&tbs, child.signature_algorithm.oid, sig, &spki)
 }
 
@@ -705,8 +907,12 @@ fn verify_signature(tbs: &[u8], oid: ObjectIdentifier, sig: &[u8], signer_spki_d
         } else {
             VerifyingKey::<Sha512>::new(pubkey).verify(tbs, &signature).is_ok()
         }
-    } else if oid == ECDSA_WITH_SHA_256 || oid == ECDSA_WITH_SHA_384 || oid == ECDSA_WITH_SHA_512 {
-        verify_ecdsa(signer_spki_der, tbs, sig)
+    } else if oid == ECDSA_WITH_SHA_256 {
+        verify_ecdsa(signer_spki_der, &Sha256::digest(tbs), sig)
+    } else if oid == ECDSA_WITH_SHA_384 {
+        verify_ecdsa(signer_spki_der, &Sha384::digest(tbs), sig)
+    } else if oid == ECDSA_WITH_SHA_512 {
+        verify_ecdsa(signer_spki_der, &Sha512::digest(tbs), sig)
     } else if oid == ID_ED_25519 {
         verify_ed25519(signer_spki_der, tbs, sig)
     } else {
@@ -715,7 +921,7 @@ fn verify_signature(tbs: &[u8], oid: ObjectIdentifier, sig: &[u8], signer_spki_d
 }
 
 /// Verify an Ed25519 certificate signature.
-fn verify_ed25519(spki_der: &[u8], tbs: &[u8], sig: &[u8]) -> bool {
+pub(crate) fn verify_ed25519(spki_der: &[u8], tbs: &[u8], sig: &[u8]) -> bool {
     use signature::Verifier as _;
     use spki::DecodePublicKey as _;
     if let (Ok(vk), Ok(s)) = (
@@ -727,21 +933,21 @@ fn verify_ed25519(spki_der: &[u8], tbs: &[u8], sig: &[u8]) -> bool {
     false
 }
 
-/// Verify an ECDSA certificate signature over P-256 or P-384 (with the curve's
-/// standard hash). The DER signature is `ECDSA-Sig-Value`.
-fn verify_ecdsa(spki_der: &[u8], tbs: &[u8], sig: &[u8]) -> bool {
-    use signature::Verifier as _;
-    if let (Ok(vk), Ok(s)) = (
-        p256::ecdsa::VerifyingKey::from_public_key_der(spki_der),
-        p256::ecdsa::DerSignature::try_from(sig),
-    ) {
-        return vk.verify(tbs, &s).is_ok();
+/// Verify an ECDSA signature (DER `ECDSA-Sig-Value`) over an already computed
+/// message digest, on P-256 or P-384 — whichever curve the SPKI names. The
+/// digest is the one the algorithm identifier declares (not the curve's
+/// "natural" hash), so P-256 with SHA-384/512 and P-384 with SHA-256 verify
+/// per RFC 5480 §2.1.1.
+pub(crate) fn verify_ecdsa(spki_der: &[u8], prehash: &[u8], sig: &[u8]) -> bool {
+    if let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der) {
+        return p256::ecdsa::Signature::from_der(sig)
+            .map(|s| vk.verify_prehash(prehash, &s).is_ok())
+            .unwrap_or(false);
     }
-    if let (Ok(vk), Ok(s)) = (
-        p384::ecdsa::VerifyingKey::from_public_key_der(spki_der),
-        p384::ecdsa::DerSignature::try_from(sig),
-    ) {
-        return vk.verify(tbs, &s).is_ok();
+    if let Ok(vk) = p384::ecdsa::VerifyingKey::from_public_key_der(spki_der) {
+        return p384::ecdsa::Signature::from_der(sig)
+            .map(|s| vk.verify_prehash(prehash, &s).is_ok())
+            .unwrap_or(false);
     }
     false
 }

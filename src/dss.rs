@@ -2,10 +2,15 @@
 //!
 //! Gathers the validation material — every certificate involved (signer chain
 //! plus the TSA chain embedded in the signature timestamp) and, best-effort,
-//! the CRLs referenced by those certificates — and embeds it in a `/DSS`
-//! dictionary added to the document catalog via an incremental update. This is
-//! what lets a signature be validated long after the issuing CA / TSA services
-//! are gone.
+//! the CRLs and OCSP responses referenced by those certificates — and merges it
+//! into the `/DSS` dictionary of the document catalog via an incremental
+//! update. This is what lets a signature be validated long after the issuing
+//! CA / TSA services are gone.
+//!
+//! Fetching is best-effort: an unreachable distribution point or responder is
+//! skipped, so a B-LT signature produced offline may carry certificates only.
+//! Verification treats missing revocation evidence as soft-fail (see
+//! `trust.rs`).
 
 use cms::cert::CertificateChoices;
 use cms::content_info::ContentInfo;
@@ -26,6 +31,7 @@ use x509_ocsp::{OcspResponse, OcspResponseStatus, Request};
 
 use crate::error::Error;
 use crate::incremental::{last_startxref, Incremental};
+use crate::sign::load_for_update;
 use crate::Result;
 
 const ID_AA_TIME_STAMP_TOKEN: ObjectIdentifier =
@@ -195,11 +201,26 @@ fn crl_urls(cert: &Certificate) -> Vec<String> {
     urls
 }
 
-/// Append a `/DSS` dictionary (with `/Certs` and `/CRLs`) to the catalog as an
-/// incremental update.
+/// Append validation material to the catalog's `/DSS` as an incremental
+/// update, **merging** with any Document Security Store already present
+/// (ETSI EN 319 142-1 §5.4.2: an updated DSS keeps the earlier values). Streams
+/// whose DER is already referenced are not duplicated; `/VRI` and any other
+/// existing entries are preserved. A `/DSS` held as an indirect object is
+/// rewritten in place; an inline one stays inline.
 pub(crate) fn add_dss(pdf: &[u8], material: &ValidationMaterial) -> Result<Vec<u8>> {
-    let doc = Document::load_mem(pdf)?;
+    let doc = load_for_update(pdf)?;
     let root_id = doc.trailer.get(b"Root")?.as_reference()?;
+    let catalog = doc.get_object(root_id)?.as_dict()?.clone();
+
+    // Existing DSS (inline or referenced) and where it lives.
+    let (mut dss, dss_ref): (Dictionary, Option<lopdf::ObjectId>) = match catalog.get(b"DSS") {
+        Ok(Object::Dictionary(d)) => (d.clone(), None),
+        Ok(Object::Reference(r)) => match doc.get_object(*r).and_then(|o| o.as_dict()) {
+            Ok(d) => (d.clone(), Some(*r)),
+            Err(_) => (Dictionary::new(), None),
+        },
+        _ => (Dictionary::new(), None),
+    };
 
     let mut inc = Incremental::new(pdf);
     let mut next_id = doc.max_id + 1;
@@ -209,48 +230,55 @@ pub(crate) fn add_dss(pdf: &[u8], material: &ValidationMaterial) -> Result<Vec<u
         id
     };
 
-    let mut dss = Dictionary::new();
+    // Merge one array (`/Certs`, `/CRLs`, `/OCSPs`): keep existing references,
+    // add a stream for each DER blob not already present.
+    let mut merge = |key: &str, ders: &[Vec<u8>]| {
+        let mut refs: Vec<Object> = match dss.get(key.as_bytes()) {
+            Ok(Object::Array(a)) => a.clone(),
+            Ok(Object::Reference(r)) => doc
+                .get_object(*r)
+                .and_then(|o| o.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let existing: Vec<Vec<u8>> = refs
+            .iter()
+            .filter_map(|o| o.as_reference().ok())
+            .filter_map(|id| doc.get_object(id).ok())
+            .filter_map(|o| o.as_stream().ok())
+            .map(|s| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+            .collect();
+        for der in ders {
+            if existing.iter().any(|e| e == der) {
+                continue;
+            }
+            let id = alloc();
+            inc.add(id, der_stream(der));
+            refs.push(Object::Reference(id));
+        }
+        if !refs.is_empty() {
+            dss.set(key, Object::Array(refs));
+        }
+    };
+    merge("Certs", &material.certs);
+    merge("CRLs", &material.crls);
+    merge("OCSPs", &material.ocsps);
 
-    let mut cert_refs = Vec::new();
-    for der in &material.certs {
-        let id = alloc();
-        inc.add(id, der_stream(der));
-        cert_refs.push(Object::Reference(id));
+    // Re-emit the DSS where it lives; the catalog only when the DSS is inline.
+    match dss_ref {
+        Some(id) => inc.add(id, Object::Dictionary(dss)),
+        None => {
+            let mut catalog = catalog;
+            catalog.set("DSS", Object::Dictionary(dss));
+            inc.add(root_id, Object::Dictionary(catalog));
+        }
     }
-    if !cert_refs.is_empty() {
-        dss.set("Certs", Object::Array(cert_refs));
-    }
-
-    let mut crl_refs = Vec::new();
-    for der in &material.crls {
-        let id = alloc();
-        inc.add(id, der_stream(der));
-        crl_refs.push(Object::Reference(id));
-    }
-    if !crl_refs.is_empty() {
-        dss.set("CRLs", Object::Array(crl_refs));
-    }
-
-    let mut ocsp_refs = Vec::new();
-    for der in &material.ocsps {
-        let id = alloc();
-        inc.add(id, der_stream(der));
-        ocsp_refs.push(Object::Reference(id));
-    }
-    if !ocsp_refs.is_empty() {
-        dss.set("OCSPs", Object::Array(ocsp_refs));
-    }
-
-    // Re-emit the catalog with the new /DSS entry, preserving everything else.
-    let mut catalog = doc.get_object(root_id)?.as_dict()?.clone();
-    catalog.set("DSS", Object::Dictionary(dss));
-    inc.add(root_id, Object::Dictionary(catalog));
 
     let size = next_id;
     let prev = last_startxref(pdf)
         .ok_or_else(|| Error::Malformed("original PDF has no startxref".into()))?;
-    let id_array = doc.trailer.get(b"ID").ok().cloned();
-    Ok(inc.render(size, root_id, prev, id_array))
+    Ok(inc.render(size, root_id, prev, &doc.trailer).bytes)
 }
 
 /// A stream object whose content is the given DER blob (no filter).
