@@ -1,9 +1,11 @@
 [package]
 name = "pdf_signer"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
-# The locked dependency set (time 0.3.49, clap 4.6, base64ct 1.8) needs 1.88.
-rust-version = "1.88"
+# Minimum toolchain for this crate's own source. The committed Cargo.lock resolves
+# newer transitive releases (time 0.3.49, clap 4.6, base64ct 1.8) that need 1.88;
+# downstream builds on older toolchains pin those (e.g. `time = 0.3.45`, MSRV 1.83).
+rust-version = "1.83"
 description = "Sign PDF documents with a PKCS#12 keystore and verify their signatures (PAdES B-B → B-LTA)."
 license = "GPL-3.0-or-later"
 repository = "https://github.com/StrategicProjects/pdf_signer"

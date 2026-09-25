@@ -23,7 +23,8 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode an ASCII hex string into bytes. Ignores nothing; expects even length.
 pub(crate) fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    #[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs Rust 1.87; MSRV is 1.83
+    if hex.len() % 2 != 0 {
         return None;
     }
     fn val(c: u8) -> Option<u8> {

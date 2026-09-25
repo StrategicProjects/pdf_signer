@@ -354,8 +354,8 @@ fn image_stream(
         d.set(
             "Decode",
             Object::Array(
-                std::iter::repeat_n([Object::Integer(1), Object::Integer(0)], 4)
-                    .flatten()
+                (0..4)
+                    .flat_map(|_| [Object::Integer(1), Object::Integer(0)])
                     .collect(),
             ),
         );

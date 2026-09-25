@@ -1,7 +1,7 @@
 # pdf_signer
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org)
 [![PAdES](https://img.shields.io/badge/PAdES-B--B%20%E2%86%92%20B--LTA-success.svg)](#pades-levels)
 ![pure Rust](https://img.shields.io/badge/crypto-pure%20RustCrypto-success.svg)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21366481-blue.svg)](https://doi.org/10.5281/zenodo.21366481)
