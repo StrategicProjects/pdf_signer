@@ -327,7 +327,8 @@ reads [`CITATION.cff`](CITATION.cff) for BibTeX/APA.
 ```bibtex
 @software{leite_pdf_signer,
   author    = {Leite, André and Vasconcelos, Hugo and Bezerra, Diogo and
-               Wasiliew, Marcos and Amorim, Carlos},
+               Wasiliew, Marcos and Amorim, Carlos and
+               Nascimento Barreto, Júlia},
   title     = {{pdf_signer: a pure-Rust engine to digitally sign and verify PDF documents (PAdES B-B → B-LTA)}},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.21366481},

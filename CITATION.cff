@@ -35,18 +35,26 @@ authors:
     family-names: Vasconcelos
     email: hugo.vasconcelos@ufpe.br
     affiliation: Universidade Federal de Pernambuco
+    orcid: "https://orcid.org/0000-0001-6249-0920"
   - given-names: Diogo
     family-names: Bezerra
     email: diogo.bezerra@ufpe.br
     affiliation: Universidade Federal de Pernambuco
+    orcid: "https://orcid.org/0000-0002-1216-8674"
   - given-names: Marcos
     family-names: Wasiliew
-    email: marcos.wasilew@gmail.com
+    email: marcos.wasiliew@gmail.com
     affiliation: Universidade Federal de Pernambuco
+    orcid: "https://orcid.org/0009-0004-4694-3159"
   - given-names: Carlos
     family-names: Amorim
     email: carlos.agaf@ufpe.br
     affiliation: Universidade Federal de Pernambuco
+    orcid: "https://orcid.org/0000-0001-6315-8305"
+  - given-names: Júlia
+    family-names: Nascimento Barreto
+    email: juliabarreto@gd.seplag.pe.gov.br
+    orcid: "https://orcid.org/0009-0004-2851-7770"
 abstract: >-
   pdf_signer is a self-contained Rust library and CLI to digitally sign and
   verify PDF documents, implementing the PAdES baseline profiles (ETSI EN 319
