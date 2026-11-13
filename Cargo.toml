@@ -1,6 +1,6 @@
 [package]
 name = "pdf_signer"
-version = "0.3.2"
+version = "0.3.3"
 authors = [
     "André Leite <leite@castlab.org>",
     "Hugo Vasconcelos <hugo.vasconcelos@ufpe.br>",
